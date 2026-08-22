@@ -1,0 +1,2800 @@
+## 構成
+
+```text
+claude-cloudflare-chat/
+├─ src/
+│  ├─ client/
+│  │  ├─ App.tsx
+│  │  ├─ main.tsx
+│  │  └─ styles.css
+│  ├─ shared/
+│  │  └─ types.ts
+│  └─ worker/
+│     ├─ auth.ts
+│     ├─ claude.ts
+│     └─ index.ts
+├─ tests/
+│  ├─ auth.test.ts
+│  └─ claude.test.ts
+├─ .dev.vars.example
+├─ .gitignore
+├─ index.html
+├─ package.json
+├─ tsconfig.json
+├─ vite.config.ts
+├─ vitest.config.ts
+├─ wrangler.toml
+└─ README.md
+```
+
+- 指定された Sonnet 5 / Opus 5 は、確認可能な公式モデルとして提供されていないため偽装せず、次へ置き換えています。
+  - Haiku 4.5: `claude-haiku-4-5-20251001`
+  - Sonnet 4.5: `claude-sonnet-4-5-20250929`
+  - Opus 4.5: `claude-opus-4-5-20251101`
+- `effort` は Opus 4.5 のみUIで有効化します。
+- `effort` は `output_config.effort` と公式ベータヘッダーを使用します。
+- アクセスコード `1359` はブラウザへ埋め込まず、Cloudflare Worker側の環境変数で照合します。
+
+## `package.json`
+
+```json
+{
+  "name": "claude-cloudflare-chat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build && wrangler dev",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "deploy": "npm run check && wrangler deploy"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251121.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.13",
+    "wrangler": "^4.50.0"
+  }
+}
+```
+
+## `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "types": [
+      "@cloudflare/workers-types",
+      "vite/client"
+    ]
+  },
+  "include": [
+    "src",
+    "tests",
+    "vite.config.ts",
+    "vitest.config.ts"
+  ]
+}
+```
+
+## `vite.config.ts`
+
+```typescript
+// File: vite.config.ts
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [react()],
+  root: ".",
+  build: {
+    outDir: "dist",
+    emptyOutDir: true,
+  },
+});
+```
+
+## `vitest.config.ts`
+
+```typescript
+// File: vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    include: ["tests/**/*.test.ts"],
+  },
+});
+```
+
+## `wrangler.toml`
+
+```toml
+# File: wrangler.toml
+name = "claude-cloudflare-chat"
+main = "src/worker/index.ts"
+compatibility_date = "2025-11-21"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+```
+
+## `.dev.vars.example`
+
+```dotenv
+CLAUDE_API_KEY=sk-ant-api03-replace-me
+ACCESS_CODE=1359
+SESSION_SECRET=replace-with-at-least-32-random-characters
+```
+
+## `.gitignore`
+
+```gitignore
+# File: .gitignore
+node_modules/
+dist/
+.dev.vars
+.wrangler/
+coverage/
+.DS_Store
+*.log
+```
+
+## `index.html`
+
+```html
+<!-- File: index.html -->
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta
+      name="description"
+      content="Cloudflare上で動作するシンプルなClaudeチャット"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <title>Claude Chat</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/client/main.tsx"></script>
+  </body>
+</html>
+```
+
+## `src/shared/types.ts`
+
+```typescript
+// File: src/shared/types.ts
+export type ChatRole = "user" | "assistant";
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+}
+
+export type Effort = "low" | "medium" | "high";
+
+export interface PublicModel {
+  id: string;
+  label: string;
+  effortSupported: boolean;
+  effortOptions: Effort[];
+}
+
+export interface ModelsResponse {
+  models: PublicModel[];
+}
+
+export interface SessionResponse {
+  authenticated: boolean;
+}
+
+export interface LoginResponse {
+  authenticated: boolean;
+}
+
+export interface ChatRequest {
+  model: string;
+  effort?: Effort;
+  messages: Array<Pick<ChatMessage, "role" | "content">>;
+}
+
+export type StreamEvent =
+  | {
+      type: "delta";
+      text: string;
+    }
+  | {
+      type: "done";
+    }
+  | {
+      type: "error";
+      message: string;
+    };
+```
+
+## `src/worker/auth.ts`
+
+```typescript
+// File: src/worker/auth.ts
+const SESSION_LIFETIME_SECONDS = 60 * 60 * 24 * 7;
+const encoder = new TextEncoder();
+
+interface SessionPayload {
+  authenticated: true;
+  expiresAt: number;
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  const paddingLength = (4 - (normalized.length % 4)) % 4;
+  const padded = normalized + "=".repeat(paddingLength);
+  const binary = atob(padded);
+
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function importSigningKey(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    {
+      name: "HMAC",
+      hash: "SHA-256",
+    },
+    false,
+    ["sign", "verify"],
+  );
+}
+
+async function sign(value: string, secret: string): Promise<string> {
+  const key = await importSigningKey(secret);
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(value),
+  );
+
+  return bytesToBase64Url(new Uint8Array(signature));
+}
+
+async function verifySignature(
+  value: string,
+  signature: string,
+  secret: string,
+): Promise<boolean> {
+  try {
+    const key = await importSigningKey(secret);
+
+    return crypto.subtle.verify(
+      "HMAC",
+      key,
+      base64UrlToBytes(signature),
+      encoder.encode(value),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function createSessionToken(
+  secret: string,
+  now = Date.now(),
+): Promise<string> {
+  const payload: SessionPayload = {
+    authenticated: true,
+    expiresAt: now + SESSION_LIFETIME_SECONDS * 1000,
+  };
+
+  const encodedPayload = bytesToBase64Url(
+    encoder.encode(JSON.stringify(payload)),
+  );
+  const signature = await sign(encodedPayload, secret);
+
+  return `${encodedPayload}.${signature}`;
+}
+
+export async function verifySessionToken(
+  token: string | undefined,
+  secret: string,
+  now = Date.now(),
+): Promise<boolean> {
+  if (!token) {
+    return false;
+  }
+
+  const parts = token.split(".");
+
+  if (parts.length !== 2) {
+    return false;
+  }
+
+  const [encodedPayload, signature] = parts;
+
+  if (!encodedPayload || !signature) {
+    return false;
+  }
+
+  const validSignature = await verifySignature(
+    encodedPayload,
+    signature,
+    secret,
+  );
+
+  if (!validSignature) {
+    return false;
+  }
+
+  try {
+    const payloadJson = new TextDecoder().decode(
+      base64UrlToBytes(encodedPayload),
+    );
+    const payload = JSON.parse(payloadJson) as Partial<SessionPayload>;
+
+    return (
+      payload.authenticated === true &&
+      typeof payload.expiresAt === "number" &&
+      payload.expiresAt > now
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function readCookie(
+  request: Request,
+  cookieName: string,
+): string | undefined {
+  const cookieHeader = request.headers.get("Cookie");
+
+  if (!cookieHeader) {
+    return undefined;
+  }
+
+  for (const segment of cookieHeader.split(";")) {
+    const [rawName, ...rawValueParts] = segment.trim().split("=");
+
+    if (rawName === cookieName) {
+      return decodeURIComponent(rawValueParts.join("="));
+    }
+  }
+
+  return undefined;
+}
+
+export function createSessionCookie(
+  token: string,
+  secure: boolean,
+): string {
+  const attributes = [
+    `session=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${SESSION_LIFETIME_SECONDS}`,
+  ];
+
+  if (secure) {
+    attributes.push("Secure");
+  }
+
+  return attributes.join("; ");
+}
+
+export function createExpiredSessionCookie(secure: boolean): string {
+  const attributes = [
+    "session=",
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    "Max-Age=0",
+  ];
+
+  if (secure) {
+    attributes.push("Secure");
+  }
+
+  return attributes.join("; ");
+}
+
+export function constantTimeStringEqual(
+  left: string,
+  right: string,
+): boolean {
+  const leftBytes = encoder.encode(left);
+  const rightBytes = encoder.encode(right);
+  const length = Math.max(leftBytes.length, rightBytes.length);
+
+  let difference = leftBytes.length ^ rightBytes.length;
+
+  for (let index = 0; index < length; index += 1) {
+    difference |=
+      (leftBytes[index] ?? 0) ^
+      (rightBytes[index] ?? 0);
+  }
+
+  return difference === 0;
+}
+```
+
+## `src/worker/claude.ts`
+
+```typescript
+// File: src/worker/claude.ts
+import type {
+  ChatRequest,
+  Effort,
+  PublicModel,
+  StreamEvent,
+} from "../shared/types";
+
+const ANTHROPIC_API_ENDPOINT = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION = "2023-06-01";
+const EFFORT_BETA_HEADER = "effort-2025-11-24";
+
+const MAX_MESSAGES = 40;
+const MAX_MESSAGE_CHARACTERS = 20_000;
+const MAX_TOTAL_CHARACTERS = 100_000;
+const MAX_OUTPUT_TOKENS = 4_096;
+
+interface ModelDefinition extends PublicModel {
+  effortBetaHeader?: string;
+}
+
+export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
+  {
+    id: "claude-haiku-4-5-20251001",
+    label: "Haiku 4.5",
+    effortSupported: false,
+    effortOptions: [],
+  },
+  {
+    id: "claude-sonnet-4-5-20250929",
+    label: "Sonnet 4.5",
+    effortSupported: false,
+    effortOptions: [],
+  },
+  {
+    id: "claude-opus-4-5-20251101",
+    label: "Opus 4.5",
+    effortSupported: true,
+    effortOptions: ["low", "medium", "high"],
+    effortBetaHeader: EFFORT_BETA_HEADER,
+  },
+] as const;
+
+interface ClaudeMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+interface ClaudeRequestBody {
+  model: string;
+  max_tokens: number;
+  messages: ClaudeMessage[];
+  output_config?: {
+    effort: Effort;
+  };
+}
+
+export class ClientInputError extends Error {}
+
+export function getPublicModels(): PublicModel[] {
+  return MODEL_DEFINITIONS.map(
+    ({
+      id,
+      label,
+      effortSupported,
+      effortOptions,
+    }) => ({
+      id,
+      label,
+      effortSupported,
+      effortOptions: [...effortOptions],
+    }),
+  );
+}
+
+export function buildClaudeRequest(input: ChatRequest): {
+  body: ClaudeRequestBody;
+  betaHeader?: string;
+} {
+  const model = MODEL_DEFINITIONS.find(
+    (candidate) => candidate.id === input.model,
+  );
+
+  if (!model) {
+    throw new ClientInputError("選択されたモデルは利用できません。");
+  }
+
+  if (
+    !Array.isArray(input.messages) ||
+    input.messages.length === 0 ||
+    input.messages.length > MAX_MESSAGES
+  ) {
+    throw new ClientInputError("メッセージ数が許容範囲を超えています。");
+  }
+
+  let totalCharacters = 0;
+
+  const messages = input.messages.map((message): ClaudeMessage => {
+    if (
+      message.role !== "user" &&
+      message.role !== "assistant"
+    ) {
+      throw new ClientInputError("メッセージ形式が不正です。");
+    }
+
+    if (
+      typeof message.content !== "string" ||
+      message.content.trim().length === 0
+    ) {
+      throw new ClientInputError("空のメッセージは送信できません。");
+    }
+
+    if (message.content.length > MAX_MESSAGE_CHARACTERS) {
+      throw new ClientInputError("1件のメッセージが長すぎます。");
+    }
+
+    totalCharacters += message.content.length;
+
+    return {
+      role: message.role,
+      content: message.content,
+    };
+  });
+
+  if (messages.at(-1)?.role !== "user") {
+    throw new ClientInputError(
+      "最後のメッセージはユーザー入力である必要があります。",
+    );
+  }
+
+  if (totalCharacters > MAX_TOTAL_CHARACTERS) {
+    throw new ClientInputError("会話履歴が長すぎます。");
+  }
+
+  const body: ClaudeRequestBody = {
+    model: model.id,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    messages,
+  };
+
+  if (input.effort !== undefined) {
+    if (
+      !model.effortSupported ||
+      !model.effortOptions.includes(input.effort)
+    ) {
+      throw new ClientInputError(
+        "このモデルでは指定されたeffortを利用できません。",
+      );
+    }
+
+    body.output_config = {
+      effort: input.effort,
+    };
+  }
+
+  return {
+    body,
+    betaHeader:
+      input.effort !== undefined
+        ? model.effortBetaHeader
+        : undefined,
+  };
+}
+
+function encodeEvent(event: StreamEvent): Uint8Array {
+  return new TextEncoder().encode(`${JSON.stringify(event)}\n`);
+}
+
+function parseAnthropicEvent(block: string): {
+  eventName: string;
+  data: unknown;
+} | null {
+  let eventName = "";
+  const dataLines: string[] = [];
+
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      eventName = line.slice("event:".length).trim();
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  try {
+    return {
+      eventName,
+      data: JSON.parse(dataLines.join("\n")) as unknown,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readTextDelta(data: unknown): string | null {
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    !("type" in data) ||
+    data.type !== "content_block_delta" ||
+    !("delta" in data) ||
+    typeof data.delta !== "object" ||
+    data.delta === null ||
+    !("type" in data.delta) ||
+    data.delta.type !== "text_delta" ||
+    !("text" in data.delta) ||
+    typeof data.delta.text !== "string"
+  ) {
+    return null;
+  }
+
+  return data.delta.text;
+}
+
+function createSafeStream(
+  anthropicBody: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const reader = anthropicBody.getReader();
+  const decoder = new TextDecoder();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let buffer = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split(/\r?\n\r?\n/);
+          buffer = blocks.pop() ?? "";
+
+          for (const block of blocks) {
+            const parsed = parseAnthropicEvent(block);
+
+            if (!parsed) {
+              continue;
+            }
+
+            if (parsed.eventName === "error") {
+              console.error("Anthropic stream returned an error event.");
+              controller.enqueue(
+                encodeEvent({
+                  type: "error",
+                  message:
+                    "回答の生成中にエラーが発生しました。もう一度お試しください。",
+                }),
+              );
+              controller.close();
+              return;
+            }
+
+            const text = readTextDelta(parsed.data);
+
+            if (text !== null) {
+              controller.enqueue(
+                encodeEvent({
+                  type: "delta",
+                  text,
+                }),
+              );
+            }
+          }
+        }
+
+        controller.enqueue(
+          encodeEvent({
+            type: "done",
+          }),
+        );
+        controller.close();
+      } catch (error) {
+        console.error("Claude stream processing failed.", error);
+
+        controller.enqueue(
+          encodeEvent({
+            type: "error",
+            message:
+              "通信が途中で終了しました。もう一度お試しください。",
+          }),
+        );
+        controller.close();
+      } finally {
+        reader.releaseLock();
+      }
+    },
+
+    async cancel(reason) {
+      await reader.cancel(reason);
+    },
+  });
+}
+
+export async function callClaude(
+  input: ChatRequest,
+  apiKey: string,
+): Promise<Response> {
+  const { body, betaHeader } = buildClaudeRequest(input);
+
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "x-api-key": apiKey,
+    "anthropic-version": ANTHROPIC_VERSION,
+  });
+
+  if (betaHeader) {
+    headers.set("anthropic-beta", betaHeader);
+  }
+
+  let upstreamResponse: Response;
+
+  try {
+    upstreamResponse = await fetch(ANTHROPIC_API_ENDPOINT, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        ...body,
+        stream: true,
+      }),
+    });
+  } catch (error) {
+    console.error("Anthropic API request failed.", error);
+
+    return Response.json(
+      {
+        error:
+          "Claude APIへ接続できませんでした。時間を置いて再度お試しください。",
+      },
+      {
+        status: 502,
+      },
+    );
+  }
+
+  if (!upstreamResponse.ok || !upstreamResponse.body) {
+    const diagnostic = await upstreamResponse.text();
+    console.error(
+      `Anthropic API error: status=${upstreamResponse.status}`,
+      diagnostic.slice(0, 2_000),
+    );
+
+    const status =
+      upstreamResponse.status === 429
+        ? 429
+        : 502;
+
+    return Response.json(
+      {
+        error:
+          status === 429
+            ? "利用が集中しています。少し待ってから再度お試しください。"
+            : "Claude APIでエラーが発生しました。設定または利用状況を確認してください。",
+      },
+      {
+        status,
+      },
+    );
+  }
+
+  return new Response(createSafeStream(upstreamResponse.body), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+```
+
+## `src/worker/index.ts`
+
+```typescript
+// File: src/worker/index.ts
+import type {
+  ChatRequest,
+  LoginResponse,
+  ModelsResponse,
+  SessionResponse,
+} from "../shared/types";
+import {
+  constantTimeStringEqual,
+  createExpiredSessionCookie,
+  createSessionCookie,
+  createSessionToken,
+  readCookie,
+  verifySessionToken,
+} from "./auth";
+import {
+  callClaude,
+  ClientInputError,
+  getPublicModels,
+} from "./claude";
+
+interface Env {
+  CLAUDE_API_KEY: string;
+  ACCESS_CODE: string;
+  SESSION_SECRET: string;
+  ASSETS: Fetcher;
+}
+
+const JSON_HEADERS = {
+  "Cache-Control": "no-store",
+  "Content-Type": "application/json; charset=utf-8",
+  "X-Content-Type-Options": "nosniff",
+};
+
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  additionalHeaders?: HeadersInit,
+): Response {
+  return Response.json(body, {
+    status,
+    headers: {
+      ...JSON_HEADERS,
+      ...additionalHeaders,
+    },
+  });
+}
+
+function isSecureRequest(request: Request): boolean {
+  return new URL(request.url).protocol === "https:";
+}
+
+function hasValidOrigin(request: Request): boolean {
+  const origin = request.headers.get("Origin");
+
+  if (!origin) {
+    return false;
+  }
+
+  return origin === new URL(request.url).origin;
+}
+
+function validateEnvironment(env: Env): string | null {
+  if (!env.CLAUDE_API_KEY) {
+    return "CLAUDE_API_KEY is not configured.";
+  }
+
+  if (!env.ACCESS_CODE) {
+    return "ACCESS_CODE is not configured.";
+  }
+
+  if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) {
+    return "SESSION_SECRET must contain at least 32 characters.";
+  }
+
+  return null;
+}
+
+async function isAuthenticated(
+  request: Request,
+  env: Env,
+): Promise<boolean> {
+  const token = readCookie(request, "session");
+
+  return verifySessionToken(token, env.SESSION_SECRET);
+}
+
+async function readJson<T>(request: Request): Promise<T> {
+  const contentType = request.headers.get("Content-Type") ?? "";
+
+  if (!contentType.startsWith("application/json")) {
+    throw new ClientInputError("JSON形式で送信してください。");
+  }
+
+  try {
+    return (await request.json()) as T;
+  } catch {
+    throw new ClientInputError("リクエスト形式が不正です。");
+  }
+}
+
+async function handleLogin(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (!hasValidOrigin(request)) {
+    return jsonResponse(
+      {
+        error: "リクエストを確認できませんでした。",
+      },
+      403,
+    );
+  }
+
+  const input = await readJson<{ code?: unknown }>(request);
+
+  if (
+    typeof input.code !== "string" ||
+    !constantTimeStringEqual(input.code, env.ACCESS_CODE)
+  ) {
+    return jsonResponse(
+      {
+        error: "アクセスコードが正しくありません。",
+      },
+      401,
+    );
+  }
+
+  const token = await createSessionToken(env.SESSION_SECRET);
+
+  return jsonResponse(
+    {
+      authenticated: true,
+    } satisfies LoginResponse,
+    200,
+    {
+      "Set-Cookie": createSessionCookie(
+        token,
+        isSecureRequest(request),
+      ),
+    },
+  );
+}
+
+function handleLogout(request: Request): Response {
+  if (!hasValidOrigin(request)) {
+    return jsonResponse(
+      {
+        error: "リクエストを確認できませんでした。",
+      },
+      403,
+    );
+  }
+
+  return jsonResponse(
+    {
+      authenticated: false,
+    } satisfies LoginResponse,
+    200,
+    {
+      "Set-Cookie": createExpiredSessionCookie(
+        isSecureRequest(request),
+      ),
+    },
+  );
+}
+
+async function handleApi(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const url = new URL(request.url);
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/auth/login"
+  ) {
+    return handleLogin(request, env);
+  }
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/auth/logout"
+  ) {
+    return handleLogout(request);
+  }
+
+  if (
+    request.method === "GET" &&
+    url.pathname === "/api/session"
+  ) {
+    return jsonResponse({
+      authenticated: await isAuthenticated(request, env),
+    } satisfies SessionResponse);
+  }
+
+  if (!(await isAuthenticated(request, env))) {
+    return jsonResponse(
+      {
+        error: "ログインが必要です。",
+      },
+      401,
+    );
+  }
+
+  if (
+    request.method === "GET" &&
+    url.pathname === "/api/models"
+  ) {
+    return jsonResponse({
+      models: getPublicModels(),
+    } satisfies ModelsResponse);
+  }
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/chat"
+  ) {
+    if (!hasValidOrigin(request)) {
+      return jsonResponse(
+        {
+          error: "リクエストを確認できませんでした。",
+        },
+        403,
+      );
+    }
+
+    const input = await readJson<ChatRequest>(request);
+
+    return callClaude(input, env.CLAUDE_API_KEY);
+  }
+
+  return jsonResponse(
+    {
+      error: "APIが見つかりません。",
+    },
+    404,
+  );
+}
+
+function addSecurityHeaders(response: Response): Response {
+  const secured = new Response(response.body, response);
+
+  secured.headers.set(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "base-uri 'none'",
+      "connect-src 'self'",
+      "font-src 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "img-src 'self' data: https:",
+      "object-src 'none'",
+      "script-src 'self'",
+      "style-src 'self'",
+    ].join("; "),
+  );
+  secured.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  secured.headers.set("Referrer-Policy", "no-referrer");
+  secured.headers.set("X-Content-Type-Options", "nosniff");
+  secured.headers.set("X-Frame-Options", "DENY");
+
+  return secured;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const configurationError = validateEnvironment(env);
+
+    if (configurationError) {
+      console.error(configurationError);
+
+      if (new URL(request.url).pathname.startsWith("/api/")) {
+        return jsonResponse(
+          {
+            error: "サーバー設定が完了していません。",
+          },
+          503,
+        );
+      }
+    }
+
+    try {
+      const url = new URL(request.url);
+
+      if (url.pathname.startsWith("/api/")) {
+        return await handleApi(request, env);
+      }
+
+      return addSecurityHeaders(await env.ASSETS.fetch(request));
+    } catch (error) {
+      if (error instanceof ClientInputError) {
+        return jsonResponse(
+          {
+            error: error.message,
+          },
+          400,
+        );
+      }
+
+      console.error("Unhandled Worker error.", error);
+
+      return jsonResponse(
+        {
+          error:
+            "予期しないエラーが発生しました。時間を置いて再度お試しください。",
+        },
+        500,
+      );
+    }
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+## `src/client/main.tsx`
+
+```tsx
+// File: src/client/main.tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { App } from "./App";
+import "./styles.css";
+
+const rootElement = document.getElementById("root");
+
+if (!rootElement) {
+  throw new Error("Root element was not found.");
+}
+
+createRoot(rootElement).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+```
+
+## `src/client/App.tsx`
+
+```tsx
+// File: src/client/App.tsx
+import {
+  type FormEvent,
+  type KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type {
+  ChatMessage,
+  Effort,
+  ModelsResponse,
+  PublicModel,
+  SessionResponse,
+  StreamEvent,
+} from "../shared/types";
+
+const DEFAULT_MODEL_ID = "claude-sonnet-4-5-20250929";
+
+async function readError(response: Response): Promise<string> {
+  try {
+    const value = (await response.json()) as {
+      error?: unknown;
+    };
+
+    if (typeof value.error === "string") {
+      return value.error;
+    }
+  } catch {
+    return "通信エラーが発生しました。";
+  }
+
+  return "通信エラーが発生しました。";
+}
+
+async function copyText(value: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+
+    const copied = document.execCommand("copy");
+    textarea.remove();
+
+    return copied;
+  }
+}
+
+function LoginScreen({
+  onLogin,
+}: {
+  onLogin: () => void;
+}) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setSubmitting(true);
+
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          code,
+        }),
+      });
+
+      if (!response.ok) {
+        setError(await readError(response));
+        return;
+      }
+
+      onLogin();
+    } catch {
+      setError("サーバーへ接続できませんでした。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="login-layout">
+      <section className="login-panel" aria-labelledby="login-title">
+        <div>
+          <p className="product-name">Claude Chat</p>
+          <h1 id="login-title">アクセスコード</h1>
+          <p className="login-description">
+            このページを利用するにはアクセスコードを入力してください。
+          </p>
+        </div>
+
+        <form onSubmit={submit} className="login-form">
+          <label htmlFor="access-code">
+            コード
+            <span className="field-hint">
+              アルファベット大文字小文字記号を含む
+            </span>
+          </label>
+
+          <input
+            id="access-code"
+            name="access-code"
+            type="password"
+            inputMode="numeric"
+            autoComplete="current-password"
+            value={code}
+            onChange={(event) => setCode(event.target.value)}
+            autoFocus
+            required
+          />
+
+          {error ? (
+            <p className="form-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+
+          <button
+            type="submit"
+            className="primary-button"
+            disabled={submitting || code.length === 0}
+          >
+            {submitting ? "確認中…" : "続ける"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function MarkdownContent({
+  content,
+}: {
+  content: string;
+}) {
+  return (
+    <div className="markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a({ children, ...props }) {
+            return (
+              <a
+                {...props}
+                target="_blank"
+                rel="noreferrer noopener"
+              >
+                {children}
+              </a>
+            );
+          },
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function MessageItem({
+  message,
+}: {
+  message: ChatMessage;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  async function copyMessage() {
+    const succeeded = await copyText(message.content);
+
+    if (!succeeded) {
+      return;
+    }
+
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1_500);
+  }
+
+  return (
+    <article className={`message message-${message.role}`}>
+      <header className="message-header">
+        <span>
+          {message.role === "user" ? "あなた" : "Claude"}
+        </span>
+
+        <button
+          type="button"
+          className="text-button"
+          onClick={copyMessage}
+          disabled={message.content.length === 0}
+          aria-label="メッセージをコピー"
+        >
+          {copied ? "コピー済み" : "コピー"}
+        </button>
+      </header>
+
+      {message.content ? (
+        <MarkdownContent content={message.content} />
+      ) : (
+        <div className="generating" aria-label="回答を生成中">
+          <span />
+          <span />
+          <span />
+        </div>
+      )}
+    </article>
+  );
+}
+
+function ChatScreen({
+  onLogout,
+}: {
+  onLogout: () => void;
+}) {
+  const [models, setModels] = useState<PublicModel[]>([]);
+  const [modelId, setModelId] = useState(DEFAULT_MODEL_ID);
+  const [effort, setEffort] = useState<Effort>("medium");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const [inputCopied, setInputCopied] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const selectedModel = useMemo(
+    () => models.find((model) => model.id === modelId),
+    [modelId, models],
+  );
+
+  useEffect(() => {
+    async function loadModels() {
+      try {
+        const response = await fetch("/api/models", {
+          credentials: "same-origin",
+        });
+
+        if (response.status === 401) {
+          onLogout();
+          return;
+        }
+
+        if (!response.ok) {
+          setError(await readError(response));
+          return;
+        }
+
+        const data = (await response.json()) as ModelsResponse;
+        setModels(data.models);
+
+        if (!data.models.some((model) => model.id === modelId)) {
+          setModelId(data.models[0]?.id ?? "");
+        }
+      } catch {
+        setError("モデル情報を取得できませんでした。");
+      }
+    }
+
+    void loadModels();
+  }, [modelId, onLogout]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({
+      behavior: sending ? "auto" : "smooth",
+      block: "end",
+    });
+  }, [messages, sending]);
+
+  async function logout() {
+    try {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+    } finally {
+      onLogout();
+    }
+  }
+
+  async function copyInput() {
+    const succeeded = await copyText(input);
+
+    if (!succeeded) {
+      setError("入力内容をコピーできませんでした。");
+      return;
+    }
+
+    setInputCopied(true);
+    window.setTimeout(() => setInputCopied(false), 1_500);
+  }
+
+  async function sendMessage() {
+    const content = input.trim();
+
+    if (
+      !content ||
+      sending ||
+      !selectedModel
+    ) {
+      return;
+    }
+
+    setError("");
+    setSending(true);
+    setInput("");
+
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content,
+    };
+    const assistantId = crypto.randomUUID();
+    const assistantMessage: ChatMessage = {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+    };
+    const requestMessages = [...messages, userMessage].map(
+      ({ role, content: messageContent }) => ({
+        role,
+        content: messageContent,
+      }),
+    );
+
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      assistantMessage,
+    ]);
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          model: selectedModel.id,
+          effort: selectedModel.effortSupported
+            ? effort
+            : undefined,
+          messages: requestMessages,
+        }),
+      });
+
+      if (response.status === 401) {
+        onLogout();
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+
+      if (!response.body) {
+        throw new Error("ストリーミング応答を開始できませんでした。");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let streamError = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, {
+          stream: true,
+        });
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.trim()) {
+            continue;
+          }
+
+          let event: StreamEvent;
+
+          try {
+            event = JSON.parse(line) as StreamEvent;
+          } catch {
+            continue;
+          }
+
+          if (event.type === "delta") {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      content: message.content + event.text,
+                    }
+                  : message,
+              ),
+            );
+          }
+
+          if (event.type === "error") {
+            streamError = event.message;
+          }
+        }
+      }
+
+      if (streamError) {
+        throw new Error(streamError);
+      }
+    } catch (caughtError) {
+      const message =
+        caughtError instanceof Error
+          ? caughtError.message
+          : "回答を取得できませんでした。";
+
+      setError(message);
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantId && item.content.length === 0
+            ? {
+                ...item,
+                content:
+                  "回答を取得できませんでした。設定または通信状況を確認してください。",
+              }
+            : item,
+        ),
+      );
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function handleKeyDown(
+    event: KeyboardEvent<HTMLTextAreaElement>,
+  ) {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing
+    ) {
+      event.preventDefault();
+      void sendMessage();
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <div>
+          <p className="product-name">Claude Chat</p>
+          <p className="header-subtitle">
+            Markdown対応のシンプルなチャット
+          </p>
+        </div>
+
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={logout}
+        >
+          ログアウト
+        </button>
+      </header>
+
+      <main className="chat-main">
+        <section className="settings-bar" aria-label="チャット設定">
+          <label>
+            <span>モデル</span>
+            <select
+              value={modelId}
+              onChange={(event) => setModelId(event.target.value)}
+              disabled={sending || models.length === 0}
+            >
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            <span>Effort</span>
+            <select
+              value={effort}
+              onChange={(event) =>
+                setEffort(event.target.value as Effort)
+              }
+              disabled={
+                sending ||
+                !selectedModel?.effortSupported
+              }
+            >
+              {(selectedModel?.effortOptions.length
+                ? selectedModel.effortOptions
+                : ["medium"]
+              ).map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <p className="settings-note">
+            {selectedModel?.effortSupported
+              ? "Effortは回答の推論量を調整します。"
+              : "このモデルはeffort指定に対応していません。"}
+          </p>
+        </section>
+
+        <section
+          className="messages"
+          aria-live="polite"
+          aria-label="チャット履歴"
+        >
+          {messages.length === 0 ? (
+            <div className="empty-state">
+              <h1>新しい会話</h1>
+              <p>
+                質問を入力してください。入力と回答はMarkdownとして扱われます。
+              </p>
+            </div>
+          ) : (
+            messages.map((message) => (
+              <MessageItem
+                key={message.id}
+                message={message}
+              />
+            ))
+          )}
+
+          <div ref={bottomRef} />
+        </section>
+      </main>
+
+      <footer className="composer-area">
+        {error ? (
+          <p className="request-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+
+        <div className="composer">
+          <div className="composer-toolbar">
+            <span>メッセージ</span>
+
+            <button
+              type="button"
+              className="text-button"
+              onClick={copyInput}
+              disabled={input.length === 0}
+            >
+              {inputCopied ? "コピー済み" : "入力をコピー"}
+            </button>
+          </div>
+
+          <textarea
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Claudeに質問する"
+            rows={4}
+            disabled={sending}
+            maxLength={20_000}
+          />
+
+          <div className="composer-footer">
+            <span>Enterで送信・Shift + Enterで改行</span>
+
+            <button
+              type="button"
+              className="primary-button send-button"
+              onClick={sendMessage}
+              disabled={
+                sending ||
+                !input.trim() ||
+                !selectedModel
+              }
+            >
+              {sending ? "生成中…" : "送信"}
+            </button>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+export function App() {
+  const [authenticated, setAuthenticated] = useState<
+    boolean | null
+  >(null);
+
+  useEffect(() => {
+    async function loadSession() {
+      try {
+        const response = await fetch("/api/session", {
+          credentials: "same-origin",
+        });
+
+        if (!response.ok) {
+          setAuthenticated(false);
+          return;
+        }
+
+        const session = (await response.json()) as SessionResponse;
+        setAuthenticated(session.authenticated);
+      } catch {
+        setAuthenticated(false);
+      }
+    }
+
+    void loadSession();
+  }, []);
+
+  if (authenticated === null) {
+    return (
+      <main className="loading-screen">
+        <p>読み込み中…</p>
+      </main>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <LoginScreen
+        onLogin={() => setAuthenticated(true)}
+      />
+    );
+  }
+
+  return (
+    <ChatScreen
+      onLogout={() => setAuthenticated(false)}
+    />
+  );
+}
+```
+
+## `src/client/styles.css`
+
+```css
+/* File: src/client/styles.css */
+:root {
+  color-scheme: light dark;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: #202124;
+  background: #f7f7f5;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --background: #f7f7f5;
+  --surface: #ffffff;
+  --surface-subtle: #f3f3f0;
+  --text: #202124;
+  --muted: #6b6d70;
+  --border: #d9d9d4;
+  --border-strong: #b8b8b1;
+  --accent: #252624;
+  --accent-text: #ffffff;
+  --danger: #a32d2d;
+  --focus: #547ca8;
+  --code-background: #1f2124;
+  --code-text: #ececec;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 320px;
+  background: var(--background);
+  color: var(--text);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+select {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+button,
+input,
+select,
+textarea {
+  border-radius: 4px;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.login-layout,
+.loading-screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.loading-screen {
+  color: var(--muted);
+}
+
+.login-panel {
+  width: min(100%, 420px);
+  display: grid;
+  gap: 32px;
+  padding: 32px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.product-name {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.login-panel h1 {
+  margin: 0;
+  font-size: 1.75rem;
+  line-height: 1.2;
+}
+
+.login-description {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.login-form {
+  display: grid;
+  gap: 16px;
+}
+
+.login-form label,
+.settings-bar label {
+  display: grid;
+  gap: 7px;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+}
+
+input,
+select {
+  min-height: 42px;
+  padding: 9px 11px;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 104px;
+  max-height: 40vh;
+  padding: 12px;
+  border: 0;
+  border-radius: 0;
+  line-height: 1.55;
+  outline: none;
+}
+
+textarea:focus-visible {
+  outline: none;
+}
+
+.primary-button,
+.secondary-button,
+.text-button {
+  border: 0;
+  font-weight: 600;
+}
+
+.primary-button {
+  min-height: 42px;
+  padding: 9px 16px;
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.secondary-button {
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.text-button {
+  padding: 4px 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.text-button:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.form-error,
+.request-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.app-shell {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 68px;
+  padding:
+    12px
+    max(20px, calc((100vw - 960px) / 2));
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--background) 94%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.app-header .product-name {
+  margin-bottom: 2px;
+}
+
+.header-subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.chat-main {
+  width: min(100%, 960px);
+  margin: 0 auto;
+  padding: 24px 20px 180px;
+}
+
+.settings-bar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(140px, 0.6fr) 2fr;
+  align-items: end;
+  gap: 16px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-note {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.messages {
+  display: grid;
+}
+
+.empty-state {
+  padding: clamp(70px, 16vh, 150px) 0;
+  text-align: center;
+}
+
+.empty-state h1 {
+  margin: 0 0 10px;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+}
+
+.empty-state p {
+  max-width: 560px;
+  margin: 0 auto;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.message {
+  padding: 26px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.message-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 650;
+}
+
+.message-user {
+  padding-left: min(8vw, 72px);
+}
+
+.markdown {
+  overflow-wrap: anywhere;
+  font-size: 0.975rem;
+  line-height: 1.75;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 1.6em 0 0.6em;
+  line-height: 1.3;
+}
+
+.markdown h1 {
+  font-size: 1.5rem;
+}
+
+.markdown h2 {
+  font-size: 1.3rem;
+}
+
+.markdown h3 {
+  font-size: 1.1rem;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown pre,
+.markdown table {
+  margin: 0.85em 0;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 1.5rem;
+}
+
+.markdown li + li {
+  margin-top: 0.3em;
+}
+
+.markdown blockquote {
+  padding-left: 14px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--muted);
+}
+
+.markdown a {
+  color: inherit;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.markdown code {
+  padding: 0.15em 0.35em;
+  background: var(--surface-subtle);
+  font-family:
+    "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
+  font-size: 0.88em;
+}
+
+.markdown pre {
+  overflow-x: auto;
+  padding: 16px;
+  background: var(--code-background);
+  color: var(--code-text);
+}
+
+.markdown pre code {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.markdown table {
+  display: block;
+  overflow-x: auto;
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.generating {
+  display: flex;
+  gap: 5px;
+  padding: 8px 0;
+}
+
+.generating span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: pulse 1.2s infinite ease-in-out;
+}
+
+.generating span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.generating span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@keyframes pulse {
+  0%,
+  80%,
+  100% {
+    opacity: 0.3;
+  }
+
+  40% {
+    opacity: 1;
+  }
+}
+
+.composer-area {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 4;
+  padding:
+    10px
+    max(20px, calc((100vw - 920px) / 2))
+    max(16px, env(safe-area-inset-bottom));
+  background:
+    linear-gradient(
+      to bottom,
+      transparent,
+      var(--background) 22px
+    );
+}
+
+.request-error {
+  margin: 0 0 8px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: var(--surface);
+}
+
+.composer {
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 8%);
+}
+
+.composer:focus-within {
+  border-color: var(--focus);
+}
+
+.composer-toolbar,
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+.composer-toolbar {
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.composer-footer {
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.send-button {
+  min-height: 36px;
+  padding: 7px 18px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #171817;
+    --surface: #202120;
+    --surface-subtle: #2a2b29;
+    --text: #ededeb;
+    --muted: #aaa9a4;
+    --border: #373834;
+    --border-strong: #51524d;
+    --accent: #efefec;
+    --accent-text: #1c1d1b;
+    --danger: #ff9898;
+    --focus: #86acd3;
+    --code-background: #101110;
+    --code-text: #ededeb;
+  }
+}
+
+@media (max-width: 720px) {
+  .login-layout {
+    padding: 16px;
+  }
+
+  .login-panel {
+    padding: 24px 20px;
+  }
+
+  .app-header {
+    min-height: 62px;
+    padding: 10px 16px;
+  }
+
+  .header-subtitle {
+    display: none;
+  }
+
+  .chat-main {
+    padding: 16px 16px 190px;
+  }
+
+  .settings-bar {
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .settings-note {
+    grid-column: 1 / -1;
+    margin: 0;
+  }
+
+  .message {
+    padding: 22px 0;
+  }
+
+  .message-user {
+    padding-left: 20px;
+  }
+
+  .composer-area {
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .composer-footer > span {
+    display: none;
+  }
+
+  .composer-footer {
+    justify-content: flex-end;
+  }
+
+  textarea {
+    max-height: 34vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+```
+
+## `tests/auth.test.ts`
+
+```typescript
+// File: tests/auth.test.ts
+import { describe, expect, it } from "vitest";
+import {
+  constantTimeStringEqual,
+  createSessionToken,
+  verifySessionToken,
+} from "../src/worker/auth";
+
+const secret = "test-session-secret-with-more-than-32-characters";
+
+describe("session authentication", () => {
+  it("creates and verifies a valid token", async () => {
+    const now = 1_700_000_000_000;
+    const token = await createSessionToken(secret, now);
+
+    await expect(
+      verifySessionToken(token, secret, now + 1_000),
+    ).resolves.toBe(true);
+  });
+
+  it("rejects a tampered token", async () => {
+    const token = await createSessionToken(secret);
+    const tampered = `${token.slice(0, -1)}x`;
+
+    await expect(
+      verifySessionToken(tampered, secret),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects an expired token", async () => {
+    const now = 1_700_000_000_000;
+    const token = await createSessionToken(secret, now);
+
+    await expect(
+      verifySessionToken(
+        token,
+        secret,
+        now + 8 * 24 * 60 * 60 * 1_000,
+      ),
+    ).resolves.toBe(false);
+  });
+});
+
+describe("constantTimeStringEqual", () => {
+  it("accepts equal values", () => {
+    expect(constantTimeStringEqual("1359", "1359")).toBe(true);
+  });
+
+  it("rejects different values", () => {
+    expect(constantTimeStringEqual("1359", "1358")).toBe(false);
+    expect(constantTimeStringEqual("1359", "13590")).toBe(false);
+  });
+});
+```
+
+## `tests/claude.test.ts`
+
+```typescript
+// File: tests/claude.test.ts
+import { describe, expect, it } from "vitest";
+import {
+  buildClaudeRequest,
+  ClientInputError,
+} from "../src/worker/claude";
+
+describe("buildClaudeRequest", () => {
+  it("builds a Haiku request without effort", () => {
+    const result = buildClaudeRequest({
+      model: "claude-haiku-4-5-20251001",
+      messages: [
+        {
+          role: "user",
+          content: "こんにちは",
+        },
+      ],
+    });
+
+    expect(result.body).toEqual({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "user",
+          content: "こんにちは",
+        },
+      ],
+    });
+    expect(result.betaHeader).toBeUndefined();
+  });
+
+  it("adds effort for Opus 4.5", () => {
+    const result = buildClaudeRequest({
+      model: "claude-opus-4-5-20251101",
+      effort: "high",
+      messages: [
+        {
+          role: "user",
+          content: "検討してください",
+        },
+      ],
+    });
+
+    expect(result.body.output_config).toEqual({
+      effort: "high",
+    });
+    expect(result.betaHeader).toBe("effort-2025-11-24");
+  });
+
+  it("rejects effort on unsupported models", () => {
+    expect(() =>
+      buildClaudeRequest({
+        model: "claude-sonnet-4-5-20250929",
+        effort: "medium",
+        messages: [
+          {
+            role: "user",
+            content: "質問",
+          },
+        ],
+      }),
+    ).toThrow(ClientInputError);
+  });
+
+  it("rejects unknown models", () => {
+    expect(() =>
+      buildClaudeRequest({
+        model: "claude-sonnet-5",
+        messages: [
+          {
+            role: "user",
+            content: "質問",
+          },
+        ],
+      }),
+    ).toThrow(ClientInputError);
+  });
+
+  it("requires the final message to be a user message", () => {
+    expect(() =>
+      buildClaudeRequest({
+        model: "claude-haiku-4-5-20251001",
+        messages: [
+          {
+            role: "assistant",
+            content: "回答",
+          },
+        ],
+      }),
+    ).toThrow(ClientInputError);
+  });
+});
+```
+
+## `README.md`
+
+```markdown
+<!-- File: README.md -->
+# Claude Cloudflare Chat
+
+Cloudflare WorkersとStatic Assetsで動作する、シンプルなClaudeチャットWebアプリです。
+
+## 機能
+
+- サーバー側でClaude APIキーを管理
+- HttpOnly署名Cookieによる簡易ログイン
+- アクセスコードは環境変数で照合
+- Haiku 4.5、Sonnet 4.5、Opus 4.5を選択可能
+- Opus 4.5でeffortを選択可能
+- Claude Messages APIのストリーミング表示
+- 入力・回答のMarkdownレンダリング
+- GitHub Flavored Markdown対応
+- 入力欄と各メッセージのコピー
+- PC・スマートフォン対応
+- APIエラーの詳細や秘密情報をブラウザへ返さない
+- モデルIDのサーバー側許可リスト
+- 会話履歴、メッセージ長、総文字数の制限
+- CSP、SameSite Cookie、Origin検証を設定
+
+## モデルについて
+
+当初の要件にあるSonnet 5とOpus 5は、実装時点で確認可能な公式モデルとして提供されていないため使用していません。
+
+利用モデルは次のとおりです。
+
+- Haiku 4.5: `claude-haiku-4-5-20251001`
+- Sonnet 4.5: `claude-sonnet-4-5-20250929`
+- Opus 4.5: `claude-opus-4-5-20251101`
+
+未提供のモデル名を既存モデルの別名として送信する処理はありません。
+
+モデル定義は `src/worker/claude.ts` にあります。Anthropic側のモデル提供状況が変わった場合は、公式のModels overviewとMessages API仕様を確認して更新してください。
+
+## Effortについて
+
+- UIではOpus 4.5を選択した場合のみ有効になります。
+- 値は `low`、`medium`、`high` です。
+- APIリクエストでは `output_config.effort` を使用します。
+- 必要なAnthropicベータヘッダーはWorker側だけで付与します。
+- Haiku 4.5とSonnet 4.5にはeffortを送信しません。
+
+仕様変更の可能性があるため、更新時はAnthropic公式のEffortおよびMessages APIドキュメントだけを確認してください。
+
+## 必要環境
+
+- Node.js 20以上
+- npm 10以上
+- Cloudflareアカウント
+- Anthropic APIキー
+- WranglerでCloudflareへログインできる環境
+
+## インストール
+
+リポジトリのルートで `npm install` を実行します。
+
+## ローカル環境変数
+
+`.dev.vars.example` を `.dev.vars` としてコピーします。
+
+`.dev.vars` に次を設定します。
+
+- `CLAUDE_API_KEY`: Anthropic Consoleで発行したAPIキー
+- `ACCESS_CODE`: `1359`
+- `SESSION_SECRET`: 32文字以上のランダムな文字列
+
+`SESSION_SECRET` はパスワード管理ツールまたは暗号学的に安全な乱数生成方法で作成してください。
+
+`.dev.vars` は `.gitignore` の対象です。Gitへ追加しないでください。
+
+## ローカル起動
+
+`npm run dev` を実行します。
+
+このコマンドは次を実行します。
+
+- Viteでフロントエンドを `dist` にビルド
+- WranglerでWorkerとStatic Assetsをローカル起動
+- `.dev.vars` から秘密情報を読み込み
+
+Wranglerが表示したローカルアドレスをブラウザで開きます。
+
+ログイン画面には「アルファベット大文字小文字記号を含む」と表示されますが、実際のアクセスコードは `1359` です。
+
+## 開発時の確認
+
+型チェックは `npm run typecheck` で実行します。
+
+テストは `npm test` で実行します。
+
+ビルドは `npm run build` で実行します。
+
+型チェック、テスト、ビルドをまとめて実行する場合は `npm run check` を使用します。
+
+## Cloudflareへのログイン
+
+初回のみ `npx wrangler login` を実行し、ブラウザでCloudflareへのアクセスを許可します。
+
+## Cloudflare Secretsの登録
+
+次のコマンドを個別に実行します。
+
+- `npx wrangler secret put CLAUDE_API_KEY`
+- `npx wrangler secret put ACCESS_CODE`
+- `npx wrangler secret put SESSION_SECRET`
+
+`ACCESS_CODE` の入力値は `1359` です。
+
+`SESSION_SECRET` には32文字以上のランダムな値を設定します。
+
+秘密情報を `wrangler.toml` の通常変数として記述しないでください。
+
+## Cloudflareへのデプロイ
+
+`npm run deploy` を実行します。
+
+このコマンドは次を順番に実行します。
+
+- TypeScript型チェック
+- Vitestテスト
+- Viteビルド
+- Cloudflare Workersへのデプロイ
+
+完了後、WranglerがWorkerの公開先を表示します。
+
+## 更新デプロイ
+
+コード変更後は `npm run deploy` を再実行します。
+
+環境変数だけを変更する場合は、対象の `wrangler secret put` を再実行してください。
+
+## セキュリティ上の位置付け
+
+このログインは、URLを知っているだけの利用を防ぐ簡易的なアクセス制限です。
+
+本格的な利用者管理、ユーザー別権限、監査ログ、多要素認証を提供するものではありません。
+
+実装上の保護は次のとおりです。
+
+- アクセスコードはクライアントコードに含めない
+- Claude APIキーはWorker環境変数だけに保持
+- 署名済みセッションCookieを使用
+- CookieはHttpOnly、SameSite Strict
+- HTTPSではSecure属性を付与
+- 書き込みAPIで同一Originを確認
+- Claudeへ送信可能なモデルを許可リストで制限
+- Anthropic APIの詳細エラーをユーザーへ直接返さない
+- Markdown内の生HTMLを実行しない
+- CSPとフレーム埋め込み拒否を設定
+
+アクセスコードが固定かつ短いため、公開範囲が広い場合や高額利用が想定される場合はCloudflare Access、Turnstile、Rate Limiting、ユーザー認証基盤などへの置き換えを検討してください。
+
+## API構成
+
+- `POST /api/auth/login`: アクセスコードを検証してセッションCookieを発行
+- `POST /api/auth/logout`: セッションCookieを削除
+- `GET /api/session`: 現在の認証状態を返す
+- `GET /api/models`: 認証後に利用可能なモデル一覧を返す
+- `POST /api/chat`: 認証後にClaude Messages APIへ接続
+
+ClaudeのストリームはAnthropicのSSEをそのままブラウザへ転送せず、Workerで解析して安全なNDJSONイベントへ変換します。
+
+## 公式仕様の確認先
+
+実装判断にはAnthropic公式の次の一次資料を使用します。
+
+- Models overview
+- Messages API reference
+- Streaming Messages
+- Effort
+- API errors
+- Versioning
+
+第三者記事のモデル名、ベータヘッダー、対応パラメータを実装根拠にしないでください。
+```

@@ -1,0 +1,1782 @@
+- 指定の Haiku 4.5 / Sonnet 5 / Opus 5 は Anthropic 公式一次情報で確認できないため、公式モデル ID に置き換え（Haiku 3.5 / Sonnet 3.5 / Opus 3）
+- effort は公式の `thinking.budget_tokens` にのみマップ。非対応時は付与せず通常応答
+- API キーは Worker 環境変数のみ。ブラウザへは出さない
+
+## 構成
+- `src/` … Cloudflare Worker（認証・Claude プロキシ・ストリーム）
+- `public/` … ログイン／チャット UI
+- `tests/` … 認証・エラー隠蔽・モデル許可・SSE 変換
+
+```json
+{
+  "name": "claude-chat",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20241112.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.5",
+    "wrangler": "^3.91.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+```
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
+```
+
+```toml
+# File: wrangler.toml
+name = "claude-chat"
+main = "src/index.ts"
+compatibility_date = "2024-11-12"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+```
+
+```typescript
+// File: vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    include: ["tests/**/*.test.ts"],
+    environment: "node",
+  },
+});
+```
+
+```gitignore
+# File: .gitignore
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+coverage/
+.DS_Store
+*.log
+```
+
+```dotenv
+# File: .dev.vars.example
+ANTHROPIC_API_KEY=sk-ant-your-key
+SESSION_SECRET=replace-with-a-long-random-string
+ACCESS_CODE=1359
+```
+
+```typescript
+// File: src/types.ts
+export interface Env {
+  ASSETS?: {
+    fetch: (request: Request) => Promise<Response>;
+  };
+  ANTHROPIC_API_KEY?: string;
+  SESSION_SECRET?: string;
+  ACCESS_CODE?: string;
+}
+
+export type Role = "user" | "assistant";
+
+export interface ChatMessage {
+  role: Role;
+  content: string;
+}
+
+export type EffortId = "low" | "medium" | "high";
+
+export interface ModelDef {
+  key: string;
+  id: string;
+  label: string;
+  hint: string;
+  maxOutputTokens: number;
+}
+
+export interface EffortDef {
+  id: EffortId;
+  label: string;
+  budget: number;
+  maxTokens: number;
+}
+```
+
+```typescript
+// File: src/models.ts
+import type { EffortDef, ModelDef } from "./types";
+
+/**
+ * モデル ID は Anthropic 公式ドキュメントの Messages API に準拠。
+ * 指定の Haiku 4.5 / Sonnet 5 / Opus 5 は公式一次情報で確認できないため置き換え。
+ * 更新先: https://docs.anthropic.com/en/docs/about-claude/models
+ */
+export const MODELS: readonly ModelDef[] = [
+  {
+    key: "haiku",
+    id: "claude-3-5-haiku-20241022",
+    label: "Haiku 3.5",
+    hint: "高速",
+    maxOutputTokens: 8192,
+  },
+  {
+    key: "sonnet",
+    id: "claude-3-5-sonnet-20241022",
+    label: "Sonnet 3.5",
+    hint: "標準",
+    maxOutputTokens: 8192,
+  },
+  {
+    key: "opus",
+    id: "claude-3-opus-20240229",
+    label: "Opus 3",
+    hint: "高精度",
+    maxOutputTokens: 4096,
+  },
+];
+
+export const EFFORTS: readonly EffortDef[] = [
+  { id: "low", label: "低", budget: 0, maxTokens: 4096 },
+  { id: "medium", label: "中", budget: 1024, maxTokens: 8192 },
+  { id: "high", label: "高", budget: 4096, maxTokens: 8192 },
+];
+
+export function getModel(key: unknown): ModelDef | undefined {
+  if (typeof key !== "string") return undefined;
+  return MODELS.find((model) => model.key === key);
+}
+
+export function getEffort(id: unknown): EffortDef {
+  return EFFORTS.find((effort) => effort.id === id) ?? EFFORTS[0];
+}
+
+export function publicConfig() {
+  return {
+    models: MODELS.map(({ key, label, hint }) => ({ key, label, hint })),
+    efforts: EFFORTS.map(({ id, label }) => ({ id, label })),
+  };
+}
+```
+
+```typescript
+// File: src/errors.ts
+const KEY_PATTERN = /sk-ant-[a-zA-Z0-9_-]+/gi;
+const BEARER_PATTERN = /Bearer\s+\S+/gi;
+
+export function sanitizeErrorMessage(raw: string): string {
+  return raw.replace(KEY_PATTERN, "[redacted]").replace(BEARER_PATTERN, "Bearer [redacted]");
+}
+
+export function publicUpstreamError(status: number): string {
+  if (status === 401 || status === 403) {
+    return "サーバーの設定が完了していません。";
+  }
+  if (status === 429 || status === 529) {
+    return "利用が集中しています。しばらく待ってから再試行してください。";
+  }
+  if (status === 400) {
+    return "リクエストを処理できませんでした。";
+  }
+  if (status >= 500) {
+    return "応答の生成に失敗しました。時間をおいて再試行してください。";
+  }
+  return "エラーが発生しました。時間をおいて再試行してください。";
+}
+
+export function publicAppError(): string {
+  return "エラーが発生しました。時間をおいて再試行してください。";
+}
+```
+
+```typescript
+// File: src/auth.ts
+import type { Env } from "./types";
+
+const COOKIE_NAME = "session";
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function expectedAccessCode(env: Env): string {
+  return env.ACCESS_CODE && env.ACCESS_CODE.length > 0 ? env.ACCESS_CODE : "1359";
+}
+
+export function timingSafeEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const aa = encoder.encode(a);
+  const bb = encoder.encode(b);
+  const len = Math.max(aa.length, bb.length);
+  let out = aa.length === bb.length ? 0 : 1;
+  for (let i = 0; i < len; i += 1) {
+    const av = i < aa.length ? aa[i] : 0;
+    const bv = i < bb.length ? bb[i] : 0;
+    out |= av ^ bv;
+  }
+  return out === 0;
+}
+
+export async function hmacHex(secret: string, data: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(data));
+  return Array.from(new Uint8Array(sig), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function createSessionToken(secret: string, now = Date.now()): Promise<string> {
+  const payload = String(now + SESSION_TTL_MS);
+  const sig = await hmacHex(secret, payload);
+  return `${payload}.${sig}`;
+}
+
+export async function verifySessionToken(
+  secret: string,
+  token: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const index = token.lastIndexOf(".");
+  if (index <= 0) return false;
+  const payload = token.slice(0, index);
+  const sig = token.slice(index + 1);
+  const expected = await hmacHex(secret, payload);
+  if (!timingSafeEqual(sig, expected)) return false;
+  const exp = Number(payload);
+  return Number.isFinite(exp) && exp >= now;
+}
+
+export function readCookie(header: string | null, name: string): string | null {
+  if (!header) return null;
+  const parts = header.split(";");
+  for (const part of parts) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) {
+      try {
+        return decodeURIComponent(rest.join("="));
+      } catch {
+        return rest.join("=");
+      }
+    }
+  }
+  return null;
+}
+
+export function buildSessionCookie(token: string, request: Request): string {
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  const maxAge = Math.floor(SESSION_TTL_MS / 1000);
+  return `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+}
+
+export function clearSessionCookie(request: Request): string {
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  return `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${secure}`;
+}
+
+export async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
+  const secret = env.SESSION_SECRET ?? "";
+  if (!secret) return false;
+  const token = readCookie(request.headers.get("Cookie"), COOKIE_NAME);
+  if (!token) return false;
+  return verifySessionToken(secret, token);
+}
+```
+
+```typescript
+// File: src/claude.ts
+import { publicUpstreamError } from "./errors";
+import type { ChatMessage, EffortDef, ModelDef } from "./types";
+
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION = "2023-06-01";
+const MAX_MESSAGES = 40;
+const MAX_CONTENT_CHARS = 100_000;
+
+export function normalizeMessages(input: unknown): ChatMessage[] | null {
+  if (!Array.isArray(input)) return null;
+  const out: ChatMessage[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") return null;
+    const role = (item as { role?: unknown }).role;
+    const content = (item as { content?: unknown }).content;
+    if (role !== "user" && role !== "assistant") return null;
+    if (typeof content !== "string") return null;
+    const trimmed = content.slice(0, MAX_CONTENT_CHARS);
+    if (trimmed.length === 0) continue;
+    out.push({ role, content: trimmed });
+  }
+  if (out.length === 0) return null;
+  const clipped = out.slice(-MAX_MESSAGES);
+  if (clipped[clipped.length - 1].role !== "user") return null;
+  return clipped;
+}
+
+export function buildClaudeBody(
+  model: ModelDef,
+  effort: EffortDef,
+  messages: ChatMessage[],
+): Record<string, unknown> {
+  const maxTokens = Math.min(Math.max(effort.maxTokens, 256), model.maxOutputTokens);
+  const body: Record<string, unknown> = {
+    model: model.id,
+    max_tokens: maxTokens,
+    stream: true,
+    messages,
+  };
+  if (effort.budget > 0 && effort.budget < maxTokens) {
+    body.thinking = {
+      type: "enabled",
+      budget_tokens: effort.budget,
+    };
+  }
+  return body;
+}
+
+export function withoutThinking(body: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...body };
+  delete next.thinking;
+  return next;
+}
+
+export function consumeSseBlock(block: string): unknown | undefined {
+  const data = block
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("");
+  if (!data || data === "[DONE]") return undefined;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+}
+
+export function mapClaudeEvent(
+  evt: unknown,
+): { type: "text"; text: string } | { type: "done" } | { type: "error"; message: string } | null {
+  if (!evt || typeof evt !== "object") return null;
+  const type = (evt as { type?: unknown }).type;
+  if (type === "content_block_delta") {
+    const delta = (evt as { delta?: { type?: unknown; text?: unknown } }).delta;
+    if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+      return { type: "text", text: delta.text };
+    }
+    return null;
+  }
+  if (type === "message_stop") {
+    return { type: "done" };
+  }
+  if (type === "error") {
+    return { type: "error", message: publicUpstreamError(500) };
+  }
+  return null;
+}
+
+function encodeEvent(obj: unknown): Uint8Array {
+  return new TextEncoder().encode(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+export function createClaudeToClientTransform(): TransformStream<Uint8Array, Uint8Array> {
+  let buffer = "";
+  let sentDone = false;
+  const decoder = new TextDecoder();
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      buffer = buffer.replace(/\r\n/g, "\n");
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        const evt = consumeSseBlock(part);
+        const mapped = mapClaudeEvent(evt);
+        if (!mapped) continue;
+        controller.enqueue(encodeEvent(mapped));
+        if (mapped.type === "done" || mapped.type === "error") {
+          sentDone = true;
+        }
+      }
+    },
+    flush(controller) {
+      if (buffer.trim()) {
+        const evt = consumeSseBlock(buffer);
+        const mapped = mapClaudeEvent(evt);
+        if (mapped) {
+          controller.enqueue(encodeEvent(mapped));
+          if (mapped.type === "done" || mapped.type === "error") {
+            sentDone = true;
+          }
+        }
+      }
+      if (!sentDone) {
+        controller.enqueue(encodeEvent({ type: "done" }));
+      }
+    },
+  });
+}
+
+export async function streamClaude(options: {
+  apiKey: string;
+  body: Record<string, unknown>;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}): Promise<Response> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const headers = {
+    "content-type": "application/json",
+    "x-api-key": options.apiKey,
+    "anthropic-version": ANTHROPIC_VERSION,
+  };
+
+  let res = await fetchImpl(ANTHROPIC_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(options.body),
+    signal: options.signal,
+  });
+
+  if (res.status === 400 && options.body.thinking) {
+    if (res.body) {
+      await res.body.cancel();
+    }
+    res = await fetchImpl(ANTHROPIC_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(withoutThinking(options.body)),
+      signal: options.signal,
+    });
+  }
+
+  return res;
+}
+```
+
+```typescript
+// File: src/index.ts
+import {
+  buildSessionCookie,
+  clearSessionCookie,
+  createSessionToken,
+  expectedAccessCode,
+  isAuthenticated,
+  timingSafeEqual,
+} from "./auth";
+import { streamClaude, buildClaudeBody, createClaudeToClientTransform, normalizeMessages } from "./claude";
+import { publicAppError, publicUpstreamError } from "./errors";
+import { getEffort, getModel, publicConfig } from "./models";
+import type { Env } from "./types";
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+async function readJson(request: Request): Promise<unknown | null> {
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
+}
+
+async function requireAuth(request: Request, env: Env): Promise<Response | null> {
+  if (await isAuthenticated(request, env)) return null;
+  return json({ error: "ログインしてください。" }, 401);
+}
+
+async function handleLogin(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return json({ error: "リクエストを処理できませんでした。" }, 405);
+  }
+  if (!env.SESSION_SECRET) {
+    return json({ error: "サーバーの設定が完了していません。" }, 500);
+  }
+  const body = await readJson(request);
+  const code =
+    body && typeof body === "object" && "code" in body
+      ? String((body as { code?: unknown }).code ?? "").trim()
+      : "";
+  if (!timingSafeEqual(code, expectedAccessCode(env))) {
+    return json({ error: "コードが違います。" }, 401);
+  }
+  const token = await createSessionToken(env.SESSION_SECRET);
+  const res = json({ ok: true });
+  res.headers.set("Set-Cookie", buildSessionCookie(token, request));
+  return res;
+}
+
+async function handleLogout(request: Request): Promise<Response> {
+  if (request.method !== "POST") {
+    return json({ error: "リクエストを処理できませんでした。" }, 405);
+  }
+  const res = json({ ok: true });
+  res.headers.set("Set-Cookie", clearSessionCookie(request));
+  return res;
+}
+
+async function handleSession(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") {
+    return json({ error: "リクエストを処理できませんでした。" }, 405);
+  }
+  const ok = await isAuthenticated(request, env);
+  return json({ ok }, ok ? 200 : 401);
+}
+
+async function handleConfig(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") {
+    return json({ error: "リクエストを処理できませんでした。" }, 405);
+  }
+  const unauthorized = await requireAuth(request, env);
+  if (unauthorized) return unauthorized;
+  return json(publicConfig());
+}
+
+async function handleChat(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return json({ error: "リクエストを処理できませんでした。" }, 405);
+  }
+  const unauthorized = await requireAuth(request, env);
+  if (unauthorized) return unauthorized;
+  if (!env.ANTHROPIC_API_KEY) {
+    return json({ error: "サーバーの設定が完了していません。" }, 500);
+  }
+
+  const body = await readJson(request);
+  if (!body || typeof body !== "object") {
+    return json({ error: "リクエストを処理できませんでした。" }, 400);
+  }
+
+  const model = getModel((body as { model?: unknown }).model);
+  if (!model) {
+    return json({ error: "リクエストを処理できませんでした。" }, 400);
+  }
+  const effort = getEffort((body as { effort?: unknown }).effort);
+  const messages = normalizeMessages((body as { messages?: unknown }).messages);
+  if (!messages) {
+    return json({ error: "リクエストを処理できませんでした。" }, 400);
+  }
+
+  const claudeBody = buildClaudeBody(model, effort, messages);
+  const upstream = await streamClaude({
+    apiKey: env.ANTHROPIC_API_KEY,
+    body: claudeBody,
+    signal: request.signal,
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    console.error("claude_error", upstream.status);
+    const status = upstream.status === 401 || upstream.status === 403 ? 500 : 502;
+    return json({ error: publicUpstreamError(upstream.status) }, status);
+  }
+
+  return new Response(upstream.body.pipeThrough(createClaudeToClientTransform()), {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+async function handleApi(request: Request, env: Env, path: string): Promise<Response> {
+  if (path === "/api/login") return handleLogin(request, env);
+  if (path === "/api/logout") return handleLogout(request);
+  if (path === "/api/session") return handleSession(request, env);
+  if (path === "/api/config") return handleConfig(request, env);
+  if (path === "/api/chat") return handleChat(request, env);
+  return json({ error: "見つかりません。" }, 404);
+}
+
+export async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  try {
+    if (url.pathname.startsWith("/api/")) {
+      return await handleApi(request, env, url.pathname);
+    }
+    if (!env.ASSETS) {
+      return new Response("Not found", { status: 404 });
+    }
+    return env.ASSETS.fetch(request);
+  } catch {
+    console.error("unhandled");
+    return json({ error: publicAppError() }, 500);
+  }
+}
+
+export default {
+  fetch(request: Request, env: Env): Promise<Response> {
+    return handleRequest(request, env);
+  },
+};
+```
+
+```html
+<!-- File: public/index.html -->
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Chat</title>
+    <meta name="color-scheme" content="light" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%231c1c1a'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main id="view-login">
+      <form id="login-form" class="login-box" autocomplete="off">
+        <h1>Chat</h1>
+        <label for="code">アクセスコード</label>
+        <p class="hint">アルファベット大文字小文字記号を含む</p>
+        <input
+          id="code"
+          name="access-code"
+          type="password"
+          maxlength="128"
+          spellcheck="false"
+          autocomplete="off"
+          required
+        />
+        <button type="submit" id="login-submit">続ける</button>
+        <p id="login-error" class="error" hidden></p>
+      </form>
+    </main>
+
+    <main id="view-chat" hidden>
+      <header class="topbar">
+        <div class="brand">Chat</div>
+        <label class="field">
+          <span>モデル</span>
+          <select id="model-select"></select>
+        </label>
+        <label class="field">
+          <span>effort</span>
+          <select id="effort-select"></select>
+        </label>
+        <button type="button" id="logout" class="ghost">退出</button>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite"></section>
+      <p id="empty-state" class="empty">会話を始めてください</p>
+      <p id="chat-error" class="error banner" hidden></p>
+
+      <form id="composer" class="composer">
+        <label for="prompt" class="sr-only">メッセージ</label>
+        <textarea id="prompt" rows="1" placeholder="メッセージを入力"></textarea>
+        <div class="composer-actions">
+          <button type="button" id="copy-input" class="ghost">コピー</button>
+          <button type="submit" id="send">送信</button>
+        </div>
+      </form>
+    </main>
+
+    <noscript>
+      <p class="noscript">このアプリは JavaScript が必要です。</p>
+    </noscript>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js" defer></script>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
+```
+
+```css
+/* File: public/styles.css */
+:root {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --text: #1c1c1a;
+  --muted: #6f6f69;
+  --line: #e6e6e1;
+  --fill: #f1f1ee;
+  --danger: #b42318;
+  --radius: 6px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+button,
+select,
+textarea,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+#view-login,
+#view-chat {
+  min-height: 100%;
+}
+
+#view-login {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-box {
+  width: 100%;
+  max-width: 360px;
+}
+
+.login-box h1,
+.brand {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin: 0 0 28px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  font-weight: 550;
+  margin-bottom: 6px;
+}
+
+.hint {
+  margin: -2px 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+input[type="password"],
+textarea,
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  outline: none;
+}
+
+textarea {
+  resize: none;
+  min-height: 44px;
+  max-height: 180px;
+  line-height: 1.5;
+}
+
+input:focus,
+textarea:focus,
+select:focus,
+button:focus-visible {
+  box-shadow: 0 0 0 2px #ffffff, 0 0 0 4px var(--text);
+}
+
+button[type="submit"],
+#send {
+  border: 0;
+  background: var(--text);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-weight: 550;
+}
+
+button[type="submit"] {
+  width: 100%;
+  margin-top: 12px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ghost {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 12px 0 0;
+}
+
+.banner {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 0 16px 8px;
+}
+
+#view-chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px 12px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.topbar .brand {
+  margin: 0 auto 0 0;
+  font-size: 16px;
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.field span {
+  white-space: nowrap;
+}
+
+.field select {
+  width: auto;
+  min-width: 140px;
+  padding: 6px 8px;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 16px 12px;
+}
+
+.empty {
+  display: none;
+  margin: 0;
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty.visible {
+  display: block;
+}
+
+.msg {
+  max-width: 720px;
+  margin: 0 auto 20px;
+}
+
+.msg-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.msg.user .msg-body {
+  background: var(--fill);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.msg-body {
+  overflow-wrap: anywhere;
+}
+
+.msg-body > *:first-child {
+  margin-top: 0;
+}
+
+.msg-body > *:last-child {
+  margin-bottom: 0;
+}
+
+.msg-body pre {
+  background: var(--fill);
+  border: 1px solid var(--line);
+  padding: 12px;
+  overflow-x: auto;
+  border-radius: var(--radius);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.msg-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.msg-body p code {
+  background: var(--fill);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.msg-body h1,
+.msg-body h2,
+.msg-body h3 {
+  font-size: 1.05em;
+  margin: 1.1em 0 0.4em;
+}
+
+.msg-body blockquote {
+  border-left: 3px solid var(--line);
+  margin: 0.8em 0;
+  padding: 0.2em 0.8em;
+  color: var(--muted);
+}
+
+.msg-body table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.msg-body th,
+.msg-body td {
+  border: 1px solid var(--line);
+  padding: 6px 8px;
+}
+
+.msg-body a {
+  color: var(--text);
+}
+
+.msg-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.msg-row .msg-body {
+  flex: 1;
+}
+
+.cursor {
+  display: inline-block;
+  width: 0.45em;
+  height: 1em;
+  background: currentColor;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.composer {
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  padding: 12px 16px max(16px, env(safe-area-inset-bottom));
+}
+
+.composer textarea,
+.composer-actions {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+.noscript {
+  padding: 24px;
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .topbar .brand {
+    width: 100%;
+    margin-bottom: 4px;
+  }
+
+  .field select {
+    min-width: 120px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cursor {
+    animation: none;
+  }
+}
+```
+
+```javascript
+// File: public/app.js
+"use strict";
+
+const loginView = document.getElementById("view-login");
+const chatView = document.getElementById("view-chat");
+const loginForm = document.getElementById("login-form");
+const loginError = document.getElementById("login-error");
+const codeInput = document.getElementById("code");
+const modelSelect = document.getElementById("model-select");
+const effortSelect = document.getElementById("effort-select");
+const logoutButton = document.getElementById("logout");
+const messagesEl = document.getElementById("messages");
+const emptyState = document.getElementById("empty-state");
+const chatError = document.getElementById("chat-error");
+const composer = document.getElementById("composer");
+const promptEl = document.getElementById("prompt");
+const copyInputButton = document.getElementById("copy-input");
+const sendButton = document.getElementById("send");
+
+const state = {
+  messages: [],
+  streaming: false,
+  abort: null,
+};
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
+  });
+}
+
+function renderMarkdown(src) {
+  const parsed = window.marked.parse(src || "", { gfm: true, breaks: true });
+  const clean = window.DOMPurify.sanitize(parsed, { USE_PROFILES: { html: true } });
+  const holder = document.createElement("div");
+  holder.innerHTML = clean;
+  holder.querySelectorAll("a").forEach((anchor) => {
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+  });
+  return holder.innerHTML;
+}
+
+function showLogin() {
+  chatView.hidden = true;
+  loginView.hidden = false;
+  state.messages = [];
+  messagesEl.innerHTML = "";
+  codeInput.value = "";
+  codeInput.focus();
+}
+
+function showChat() {
+  loginView.hidden = true;
+  chatView.hidden = false;
+  updateEmpty();
+  promptEl.focus();
+}
+
+function showError(el, message) {
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+function updateEmpty() {
+  emptyState.classList.toggle("visible", state.messages.length === 0);
+}
+
+function setStreaming(value) {
+  state.streaming = value;
+  sendButton.disabled = value || promptEl.value.trim().length === 0;
+  modelSelect.disabled = value;
+  effortSelect.disabled = value;
+}
+
+async function copyText(text, button) {
+  const value = text ?? "";
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = value;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+  const previous = button.textContent;
+  button.textContent = "コピー済み";
+  window.setTimeout(() => {
+    button.textContent = previous;
+  }, 1500);
+}
+
+function addMessage(role, content, streaming = false) {
+  const index = state.messages.length;
+  const article = document.createElement("article");
+  article.className = `msg ${role}`;
+  article.dataset.index = String(index);
+  article.innerHTML =
+    `<div class="msg-head"><button type="button" class="ghost" data-copy="${index}">コピー</button></div>` +
+    `<div class="msg-row"><div class="msg-body markdown">${renderMarkdown(content)}</div>` +
+    `${streaming ? '<span class="cursor" aria-hidden="true"></span>' : ""}</div>`;
+  messagesEl.appendChild(article);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return article;
+}
+
+function updateMessage(article, content, streaming) {
+  const body = article.querySelector(".msg-body");
+  body.innerHTML = renderMarkdown(content);
+  let cursor = article.querySelector(".cursor");
+  if (streaming && !cursor) {
+    cursor = document.createElement("span");
+    cursor.className = "cursor";
+    cursor.setAttribute("aria-hidden", "true");
+    article.querySelector(".msg-row").appendChild(cursor);
+  }
+  if (!streaming && cursor) {
+    cursor.remove();
+  }
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function resizePrompt() {
+  promptEl.style.height = "auto";
+  promptEl.style.height = `${Math.min(promptEl.scrollHeight, 180)}px`;
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    ...options,
+  });
+  return res;
+}
+
+async function loadConfig() {
+  const res = await api("/api/config");
+  if (!res.ok) {
+    throw new Error("設定を読み込めませんでした。");
+  }
+  const data = await res.json();
+  modelSelect.innerHTML = data.models
+    .map(
+      (model) =>
+        `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)} · ${escapeHtml(model.hint)}</option>`,
+    )
+    .join("");
+  effortSelect.innerHTML = data.efforts
+    .map((effort) => `<option value="${escapeHtml(effort.id)}">${escapeHtml(effort.label)}</option>`)
+    .join("");
+  modelSelect.value = "sonnet";
+  effortSelect.value = "low";
+}
+
+async function readSse(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      const line = part.split("\n").find((item) => item.startsWith("data: "));
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line.slice(6)));
+      } catch {
+        // ignore malformed chunk
+      }
+    }
+  }
+}
+
+loginForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  showError(loginError, "");
+  const res = await api("/api/login", {
+    method: "POST",
+    body: JSON.stringify({ code: codeInput.value }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    showError(loginError, data.error || "コードが違います。");
+    return;
+  }
+  try {
+    await loadConfig();
+    showChat();
+  } catch {
+    showError(loginError, "設定を読み込めませんでした。");
+  }
+});
+
+logoutButton.addEventListener("click", async () => {
+  if (state.abort) state.abort.abort();
+  await api("/api/logout", { method: "POST" });
+  showLogin();
+});
+
+copyInputButton.addEventListener("click", () => {
+  copyText(promptEl.value, copyInputButton);
+});
+
+messagesEl.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-copy]");
+  if (!button) return;
+  const index = Number(button.getAttribute("data-copy"));
+  const item = state.messages[index];
+  if (!item) return;
+  copyText(item.content, button);
+});
+
+promptEl.addEventListener("input", () => {
+  sendButton.disabled = state.streaming || promptEl.value.trim().length === 0;
+  resizePrompt();
+});
+
+promptEl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    composer.requestSubmit();
+  }
+});
+
+composer.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const text = promptEl.value.trim();
+  if (!text || state.streaming) return;
+
+  showError(chatError, "");
+  state.messages.push({ role: "user", content: text });
+  addMessage("user", text);
+  promptEl.value = "";
+  resizePrompt();
+  updateEmpty();
+
+  const assistant = { role: "assistant", content: "" };
+  state.messages.push(assistant);
+  const article = addMessage("assistant", "", true);
+
+  const payload = {
+    model: modelSelect.value,
+    effort: effortSelect.value,
+    messages: state.messages
+      .filter((item, index, arr) => !(index === arr.length - 1 && item.role === "assistant"))
+      .map(({ role, content }) => ({ role, content })),
+  };
+
+  state.abort = new AbortController();
+  setStreaming(true);
+
+  try {
+    const res = await api("/api/chat", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal: state.abort.signal,
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || "エラーが発生しました。時間をおいて再試行してください。");
+    }
+
+    await readSse(res, (msg) => {
+      if (msg.type === "text") {
+        assistant.content += msg.text;
+        updateMessage(article, assistant.content, true);
+      } else if (msg.type === "error") {
+        throw new Error(msg.message || "応答の生成に失敗しました。時間をおいて再試行してください。");
+      }
+    });
+    updateMessage(article, assistant.content, false);
+    if (!assistant.content) {
+      showError(chatError, "応答の生成に失敗しました。時間をおいて再試行してください。");
+    }
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    updateMessage(article, assistant.content, false);
+    showError(
+      chatError,
+      err && err.message ? err.message : "エラーが発生しました。時間をおいて再試行してください。",
+    );
+  } finally {
+    state.abort = null;
+    setStreaming(false);
+  }
+});
+
+async function init() {
+  sendButton.disabled = true;
+  const res = await api("/api/session");
+  if (res.ok) {
+    const data = await res.json().catch(() => ({ ok: false }));
+    if (data.ok) {
+      await loadConfig();
+      showChat();
+      return;
+    }
+  }
+  showLogin();
+}
+
+init().catch(() => {
+  showLogin();
+});
+```
+
+```typescript
+// File: tests/auth.test.ts
+import { describe, expect, it } from "vitest";
+import {
+  createSessionToken,
+  expectedAccessCode,
+  hmacHex,
+  timingSafeEqual,
+  verifySessionToken,
+} from "../src/auth";
+
+describe("auth", () => {
+  it("accepts the default access code 1359", () => {
+    expect(expectedAccessCode({})).toBe("1359");
+    expect(timingSafeEqual("1359", expectedAccessCode({}))).toBe(true);
+    expect(timingSafeEqual("1358", "1359")).toBe(false);
+  });
+
+  it("verifies signed session tokens", async () => {
+    const secret = "test-secret-at-least-16";
+    const token = await createSessionToken(secret, 1_000);
+    await expect(verifySessionToken(secret, token, 1_000)).resolves.toBe(true);
+    await expect(verifySessionToken("other-secret-xxxx", token, 1_000)).resolves.toBe(false);
+    await expect(verifySessionToken(secret, token, 1_000 + 8 * 24 * 60 * 60 * 1000)).resolves.toBe(
+      false,
+    );
+  });
+
+  it("uses hex hmac output", async () => {
+    const hex = await hmacHex("secret", "payload");
+    expect(hex).toMatch(/^[0-9a-f]+$/);
+    expect(hex.length).toBe(64);
+  });
+});
+```
+
+```typescript
+// File: tests/errors.test.ts
+import { describe, expect, it } from "vitest";
+import { publicUpstreamError, sanitizeErrorMessage } from "../src/errors";
+
+describe("errors", () => {
+  it("strips api keys", () => {
+    const raw = "failed sk-ant-api03-abc_123 and Bearer secret-token";
+    const sanitized = sanitizeErrorMessage(raw);
+    expect(sanitized).not.toContain("sk-ant-api03-abc_123");
+    expect(sanitized).not.toContain("secret-token");
+  });
+
+  it("never returns upstream details", () => {
+    const message = publicUpstreamError(500);
+    expect(message).not.toContain("sk-ant");
+    expect(message).not.toContain("ANTHROPIC");
+  });
+});
+```
+
+```typescript
+// File: tests/models.test.ts
+import { describe, expect, it } from "vitest";
+import { getEffort, getModel, MODELS, publicConfig } from "../src/models";
+
+describe("models", () => {
+  it("exposes three official models", () => {
+    expect(MODELS.map((model) => model.key)).toEqual(["haiku", "sonnet", "opus"]);
+    expect(getModel("sonnet")?.id).toBe("claude-3-5-sonnet-20241022");
+    expect(getModel("claude-evil")).toBeUndefined();
+  });
+
+  it("does not publish model ids to the client config", () => {
+    const config = publicConfig();
+    expect(JSON.stringify(config)).not.toContain("claude-");
+    expect(getEffort("high").id).toBe("high");
+    expect(getEffort("unknown").id).toBe("low");
+  });
+});
+```
+
+```typescript
+// File: tests/claude.test.ts
+import { describe, expect, it } from "vitest";
+import {
+  buildClaudeBody,
+  consumeSseBlock,
+  mapClaudeEvent,
+  normalizeMessages,
+  withoutThinking,
+} from "../src/claude";
+import { getEffort, getModel } from "../src/models";
+
+describe("claude helpers", () => {
+  it("normalizes messages and requires a user turn last", () => {
+    expect(normalizeMessages("x")).toBeNull();
+    expect(
+      normalizeMessages([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "yo" },
+      ]),
+    ).toBeNull();
+    expect(
+      normalizeMessages([
+        { role: "user", content: "hi" },
+        { role: "system", content: "nope" },
+      ]),
+    ).toBeNull();
+    expect(normalizeMessages([{ role: "user", content: "hi" }])).toEqual([
+      { role: "user", content: "hi" },
+    ]);
+  });
+
+  it("maps effort to official thinking budget only when it fits max_tokens", () => {
+    const sonnet = getModel("sonnet")!;
+    const opus = getModel("opus")!;
+    const low = buildClaudeBody(sonnet, getEffort("low"), [{ role: "user", content: "q" }]);
+    const medium = buildClaudeBody(sonnet, getEffort("medium"), [{ role: "user", content: "q" }]);
+    const highOpus = buildClaudeBody(opus, getEffort("high"), [{ role: "user", content: "q" }]);
+    expect(low.thinking).toBeUndefined();
+    expect(medium.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+    expect(highOpus.thinking).toBeUndefined();
+    expect(withoutThinking(medium).thinking).toBeUndefined();
+  });
+
+  it("maps official sse events and ignores thinking deltas", () => {
+    const textEvt = consumeSseBlock(
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}',
+    );
+    expect(mapClaudeEvent(textEvt)).toEqual({ type: "text", text: "Hi" });
+    expect(
+      mapClaudeEvent({
+        type: "content_block_delta",
+        delta: { type: "thinking_delta", thinking: "secret chain" },
+      }),
+    ).toBeNull();
+    expect(mapClaudeEvent({ type: "message_stop" })).toEqual({ type: "done" });
+    const err = mapClaudeEvent({
+      type: "error",
+      error: { message: "sk-ant-api03-should-not-leak" },
+    });
+    expect(err?.type).toBe("error");
+    expect(JSON.stringify(err)).not.toContain("sk-ant");
+  });
+});
+```
+
+```typescript
+// File: tests/index.test.ts
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { handleRequest } from "../src/index";
+import type { Env } from "../src/types";
+
+const env: Env = {
+  ANTHROPIC_API_KEY: "sk-ant-api03-test-key-should-not-leak",
+  SESSION_SECRET: "test-secret-at-least-32-chars-long",
+  ACCESS_CODE: "1359",
+  ASSETS: {
+    fetch: async () => new Response("static", { status: 200 }),
+  },
+};
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+async function loginCookie(): Promise<string> {
+  const res = await handleRequest(
+    new Request("http://local/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: "1359" }),
+    }),
+    env,
+  );
+  const cookie = res.headers.get("Set-Cookie") ?? "";
+  return cookie.split(";")[0];
+}
+
+describe("http", () => {
+  it("rejects a wrong access code", async () => {
+    const res = await handleRequest(
+      new Request("http://local/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: "abcd" }),
+      }),
+      env,
+    );
+    const body = await res.json();
+    expect(res.status).toBe(401);
+    expect(JSON.stringify(body)).not.toContain("1359");
+  });
+
+  it("rejects chat without a session", async () => {
+    const res = await handleRequest(
+      new Request("http://local/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("does not leak the api key on upstream failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: { message: "bad sk-ant-api03-test-key-should-not-leak" } }), {
+          status: 500,
+        }),
+      ),
+    );
+    const cookie = await loginCookie();
+    const res = await handleRequest(
+      new Request("http://local/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: cookie,
+        },
+        body: JSON.stringify({
+          model: "sonnet",
+          effort: "low",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+      env,
+    );
+    const text = await res.text();
+    expect(res.status).toBe(502);
+    expect(text).not.toContain("sk-ant");
+    expect(text).not.toContain("test-key");
+  });
+
+  it("streams transformed text after login", async () => {
+    const sse =
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}\n\n' +
+      'data: {"type":"message_stop"}\n\n';
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } })),
+    );
+    const cookie = await loginCookie();
+    const res = await handleRequest(
+      new Request("http://local/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: cookie,
+        },
+        body: JSON.stringify({
+          model: "haiku",
+          effort: "low",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+      env,
+    );
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).toContain("Hello");
+    expect(text).not.toContain("content_block_delta");
+  });
+});
+```
+
+```markdown
+<!-- File: README.md -->
+# Claude Chat
+
+Cloudflare Workers 上で動く、Claude API の簡易チャットです。
+API キーはサーバー側の環境変数のみで扱い、ブラウザには出しません。
+
+## 機能
+
+- アクセスコードによる簡易ログイン（コードは `1359`）
+- モデル選択（Haiku 3.5 / Sonnet 3.5 / Opus 3）
+- effort 選択（公式の `thinking.budget_tokens` にマップ）
+- チャット履歴表示とストリーミング応答
+- 入力・出力の Markdown 表示
+- 入力欄と各回答のワンクリックコピー
+
+## モデルについて
+
+指定の Haiku 4.5 / Sonnet 5 / Opus 5 は、Anthropic 公式ドキュメントで利用を確認できませんでした。
+未提供の名前は使わず、公式のモデル ID に置き換えています。
+
+- Haiku 3.5: `claude-3-5-haiku-20241022`
+- Sonnet 3.5: `claude-3-5-sonnet-20241022`
+- Opus 3: `claude-3-opus-20240229`
+
+更新する場合は [Anthropic のモデル一覧](https://docs.anthropic.com/en/docs/about-claude/models) を確認し、`src/models.ts` を書き換えてください。
+
+## effort について
+
+UI の低 / 中 / 高は、公式 Messages API の extended thinking（`thinking.budget_tokens`）にマップします。
+非対応モデル、または `budget_tokens` が `max_tokens` 以上になる場合は thinking を付けません。
+API が 400 を返した場合は thinking なしで 1 回だけ再試行します。
+
+## 必要要件
+
+- Node.js 18 以降
+- Anthropic API キー
+- Cloudflare アカウント（デプロイ時）
+
+## 環境変数
+
+| 名前 | 必須 | 説明 |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | はい | Claude API キー。クライアントへは渡しません |
+| `SESSION_SECRET` | はい | セッション Cookie 署名用。32 文字以上を推奨 |
+| `ACCESS_CODE` | いいえ | 未設定時は `1359` |
+
+## ローカルでの起動方法
+
+1. 依存関係を入れる
+
+        npm install
+
+2. 環境変数ファイルを作る
+
+        cp .dev.vars.example .dev.vars
+
+3. `.dev.vars` を編集する
+
+        ANTHROPIC_API_KEY=（発行したキー）
+        SESSION_SECRET=（例: openssl rand -hex 32 の出力）
+        ACCESS_CODE=1359
+
+4. テストを実行する
+
+        npm test
+
+5. 開発サーバーを起動する
+
+        npm run dev
+
+6. ブラウザで `http://localhost:8787` を開く
+7. アクセスコード `1359` を入力する（画面の文字種説明は実際の条件ではありません）
+
+## Cloudflare へのデプロイ手順
+
+1. Cloudflare にログインする
+
+        npx wrangler login
+
+2. シークレットを登録する
+
+        npx wrangler secret put ANTHROPIC_API_KEY
+        npx wrangler secret put SESSION_SECRET
+
+3. アクセスコードを変える場合のみ
+
+        npx wrangler secret put ACCESS_CODE
+
+4. デプロイする
+
+        npm run deploy
+
+5. 表示された `*.workers.dev` URL を開き、`1359` でログインする
+
+長文のストリーミングは Workers の実行時間制限の影響を受けます。必要なら有料プランを使ってください。
+
+## セキュリティ
+
+- Claude API キーは Worker の環境変数のみ
+- セッションは HttpOnly Cookie（HMAC 署名）
+- モデル ID はサーバー側の許可リストでのみ解決
+- エラー応答から API キーと内部情報を除去
+
+## テスト
+
+        npm test
+```

@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Claude Chat - Mock</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --bg-subtle: #f6f7f8;
+        --bg-inset: #f0f1f3;
+        --fg: #1b1c1e;
+        --fg-muted: #62666d;
+        --fg-faint: #8a8f97;
+        --border: #e2e4e8;
+        --border-strong: #cfd3d9;
+        --accent: #2f5bd0;
+        --danger: #b3261e;
+        --radius: 6px;
+        --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", "Hiragino Sans",
+          "Noto Sans JP", Meiryo, sans-serif;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16181b;
+          --bg-subtle: #1c1f23;
+          --bg-inset: #22262b;
+          --fg: #e6e8ea;
+          --fg-muted: #a2a8b0;
+          --fg-faint: #7d848c;
+          --border: #2c3138;
+          --border-strong: #3b424a;
+          --accent: #7fa4f5;
+          --danger: #f2857d;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--sans);
+        font-size: 15px;
+        line-height: 1.7;
+        -webkit-text-size-adjust: 100%;
+      }
+
+      button {
+        font: inherit;
+        cursor: pointer;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      input[type="password"],
+      input[type="text"],
+      textarea,
+      select {
+        width: 100%;
+        font: inherit;
+        color: var(--fg);
+        background: var(--bg);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius);
+        padding: 9px 11px;
+      }
+
+      input:focus-visible,
+      textarea:focus-visible,
+      select:focus-visible,
+      button:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
+      }
+
+      .btn {
+        border: 1px solid var(--border-strong);
+        background: var(--bg);
+        color: var(--fg);
+        border-radius: var(--radius);
+        padding: 8px 14px;
+        font-size: 14px;
+      }
+
+      .btn:hover:not(:disabled) {
+        background: var(--bg-subtle);
+      }
+
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .btn-primary {
+        background: var(--fg);
+        color: var(--bg);
+        border-color: var(--fg);
+      }
+
+      .btn-primary:hover:not(:disabled) {
+        opacity: 0.88;
+        background: var(--fg);
+      }
+
+      .btn-block {
+        width: 100%;
+        margin-top: 16px;
+      }
+
+      .btn-quiet {
+        border-color: transparent;
+        background: transparent;
+        color: var(--fg-muted);
+        padding: 4px 8px;
+        font-size: 12.5px;
+        border-radius: 4px;
+      }
+
+      .btn-quiet:hover:not(:disabled) {
+        background: var(--bg-inset);
+        color: var(--fg);
+      }
+
+      .field {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .hint {
+        margin: 8px 0 0;
+        font-size: 12.5px;
+        color: var(--fg-faint);
+      }
+
+      .form-error {
+        margin-top: 14px;
+        color: var(--danger);
+        font-size: 13px;
+        min-height: 1.2em;
+      }
+
+      /* ログイン画面 */
+      .login {
+        min-height: 100dvh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+
+      .login-card {
+        width: 100%;
+        max-width: 380px;
+      }
+
+      .login-card h1 {
+        font-size: 20px;
+        letter-spacing: -0.01em;
+        margin: 0 0 6px;
+      }
+
+      .login-card .lead {
+        margin: 0 0 24px;
+        color: var(--fg-muted);
+        font-size: 14px;
+      }
+
+      /* チャット画面 */
+      .app {
+        display: flex;
+        flex-direction: column;
+        height: 100dvh;
+      }
+
+      .topbar {
+        border-bottom: 1px solid var(--border);
+        background: var(--bg);
+        flex: none;
+      }
+
+      .topbar-inner {
+        max-width: 780px;
+        margin: 0 auto;
+        padding: 10px 16px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .brand {
+        font-size: 14px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+        margin-right: auto;
+      }
+
+      .control {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12.5px;
+        color: var(--fg-muted);
+      }
+
+      .control select {
+        width: auto;
+        padding: 5px 8px;
+        font-size: 13px;
+        border-color: var(--border);
+      }
+
+      .messages {
+        flex: 1;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        background: var(--bg);
+      }
+
+      .messages-inner {
+        max-width: 780px;
+        margin: 0 auto;
+        padding: 8px 16px 40px;
+      }
+
+      .empty {
+        color: var(--fg-faint);
+        font-size: 14px;
+        padding: 48px 0;
+        text-align: center;
+      }
+
+      .msg {
+        padding: 18px 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .msg:last-child {
+        border-bottom: none;
+      }
+
+      .msg-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+
+      .msg-role {
+        font-size: 11.5px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--fg-faint);
+      }
+
+      .msg-actions {
+        margin-left: auto;
+        display: flex;
+        gap: 2px;
+      }
+
+      .msg-user .msg-body {
+        background: var(--bg-subtle);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 10px 12px;
+      }
+
+      .msg-body {
+        line-height: 1.6;
+      }
+
+      .msg-body > *:first-child {
+        margin-top: 0;
+      }
+
+      .msg-body > *:last-child {
+        margin-bottom: 0;
+      }
+
+      .caret::after {
+        content: "";
+        display: inline-block;
+        width: 7px;
+        height: 1.05em;
+        margin-left: 2px;
+        vertical-align: -0.2em;
+        background: var(--fg-muted);
+        animation: blink 1.1s steps(2, start) infinite;
+      }
+
+      @keyframes blink {
+        to {
+          visibility: hidden;
+        }
+      }
+
+      /* Markdown */
+      .md h2 {
+        font-size: 1.2em;
+        margin: 1.4em 0 0.5em;
+        line-height: 1.35;
+        letter-spacing: -0.01em;
+      }
+
+      .md p {
+        margin: 0.7em 0;
+      }
+
+      .md ul {
+        margin: 0.7em 0;
+        padding-left: 1.5em;
+      }
+
+      .md li {
+        margin: 0.25em 0;
+      }
+
+      .md code {
+        font-family: var(--mono);
+        font-size: 0.88em;
+        background: var(--bg-inset);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.1em 0.35em;
+      }
+
+      .md a {
+        color: var(--accent);
+      }
+
+      /* 入力欄 */
+      .composer {
+        flex: none;
+        border-top: 1px solid var(--border);
+        background: var(--bg);
+        padding-bottom: env(safe-area-inset-bottom);
+      }
+
+      .composer-inner {
+        max-width: 780px;
+        margin: 0 auto;
+        padding: 12px 16px 14px;
+      }
+
+      .composer textarea {
+        resize: none;
+        min-height: 46px;
+        max-height: 40dvh;
+        line-height: 1.6;
+        overflow-y: auto;
+      }
+
+      .composer-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .composer-hint {
+        font-size: 12px;
+        color: var(--fg-faint);
+        margin-right: auto;
+      }
+
+      .banner {
+        max-width: 780px;
+        margin: 0 auto 8px;
+        border: 1px solid var(--danger);
+        border-radius: var(--radius);
+        padding: 8px 12px;
+        font-size: 13px;
+        color: var(--danger);
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+      }
+
+      .banner button {
+        margin-left: auto;
+        color: inherit;
+      }
+
+      @media (max-width: 600px) {
+        .topbar-inner {
+          padding: 8px 12px;
+          gap: 8px;
+        }
+        .brand {
+          width: 100%;
+          margin-right: 0;
+        }
+        .control {
+          flex: 1 1 auto;
+        }
+        .control select {
+          flex: 1;
+          width: 100%;
+        }
+        .messages-inner,
+        .composer-inner {
+          padding-left: 12px;
+          padding-right: 12px;
+        }
+        .composer-hint {
+          display: none;
+        }
+      }
+
+      /* 状態管理 */
+      .login {
+        display: flex;
+      }
+
+      .login.hidden {
+        display: none;
+      }
+
+      .app {
+        display: flex;
+      }
+
+      .app.hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- ログイン画面 -->
+    <section class="login" id="login-view">
+      <div class="login-card">
+        <h1>Claude Chat</h1>
+        <p class="lead">続けるにはアクセスコードを入力してください。</p>
+        <form autocomplete="off" novalidate>
+          <label class="field" for="access-code">アクセスコード</label>
+          <input
+            id="access-code"
+            name="access-code"
+            type="password"
+            inputmode="text"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            required
+          />
+          <p class="hint">アルファベット大文字・小文字・記号を含む必要があります。</p>
+          <button class="btn btn-primary btn-block" type="submit">続ける</button>
+          <p class="form-error"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- チャット画面 -->
+    <section class="app hidden" id="app-view">
+      <header class="topbar">
+        <div class="topbar-inner">
+          <div class="brand">Claude Chat</div>
+          <div class="control">
+            <label for="model-select">モデル</label>
+            <select id="model-select">
+              <option>Haiku 4.5</option>
+              <option selected>Sonnet 5</option>
+              <option>Opus 5</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="effort-select">推論量</label>
+            <select id="effort-select">
+              <option>low</option>
+              <option selected>medium</option>
+              <option>high</option>
+              <option>xhigh</option>
+              <option>max</option>
+            </select>
+          </div>
+          <button class="btn-quiet" type="button">新しい会話</button>
+          <button class="btn-quiet" type="button">ログアウト</button>
+        </div>
+      </header>
+
+      <div class="messages">
+        <div class="messages-inner">
+          <!-- ユーザーメッセージ -->
+          <div class="msg msg-user">
+            <div class="msg-head">
+              <span class="msg-role">User</span>
+              <div class="msg-actions">
+                <button class="btn-quiet" type="button">コピー</button>
+              </div>
+            </div>
+            <div class="msg-body">
+              <p>Pythonで効率的なアルゴリズムを学ぶにはどうすればいい？</p>
+            </div>
+          </div>
+
+          <!-- Claudeメッセージ -->
+          <div class="msg msg-assistant">
+            <div class="msg-head">
+              <span class="msg-role">Claude</span>
+              <div class="msg-actions">
+                <button class="btn-quiet" type="button">コピー</button>
+              </div>
+            </div>
+            <div class="msg-body md">
+              <h2>Pythonでアルゴリズムを学ぶ方法</h2>
+              <p>効率的にアルゴリズムを学ぶためのステップを紹介します：</p>
+              <ul>
+                <li><strong>基礎から始める</strong> — ソート（バブルソート、マージソート）、探索（線形探索、二分探索）</li>
+                <li><strong>計算量を理解する</strong> — Big O表記を学び、各アルゴリズムの時間・空間計算量を把握</li>
+                <li><strong>実装と実験</strong> — Pythonで各アルゴリズムを実装し、異なるサイズのデータで性能を測定</li>
+                <li><strong>データ構造を学ぶ</strong> — リスト、スタック、キュー、ツリーなどの基本データ構造</li>
+                <li><strong>実践的な問題を解く</strong> — LeetCodeやAtCoderで問題を解いて応用力を養う</li>
+              </ul>
+              <p>推奨リソース：</p>
+              <ul>
+                <li><code>Introduction to Algorithms</code>（CLRS）— 理論的基礎</li>
+                <li><code>Cracking the Coding Interview</code> — 実践的なスキル</li>
+                <li>LeetCode、AtCoder — 日々のトレーニング</li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- ユーザーメッセージ2 -->
+          <div class="msg msg-user">
+            <div class="msg-head">
+              <span class="msg-role">User</span>
+              <div class="msg-actions">
+                <button class="btn-quiet" type="button">コピー</button>
+              </div>
+            </div>
+            <div class="msg-body">
+              <p>DPについても教えてください。</p>
+            </div>
+          </div>
+
+          <!-- Claudeメッセージ（ストリーミング中） -->
+          <div class="msg msg-assistant">
+            <div class="msg-head">
+              <span class="msg-role">Claude<span class="caret"></span></span>
+              <div class="msg-actions">
+                <button class="btn-quiet" type="button" disabled>コピー</button>
+              </div>
+            </div>
+            <div class="msg-body md">
+              <h2>動的計画法（DP）について</h2>
+              <p>動的計画法は、大きな問題を小さな部分問題に分割し、その結果をメモ化（キャッシュ）することで効率的に解くアルゴリズム設計手法です。</p>
+              <p><strong>基本原則：</strong></p>
+              <ul>
+                <li><strong>最適部分構造</strong> — 問題の最適解が部分問題の最適解から構成される</li>
+                <li><strong>部分問題の重複</strong> — 同じ部分問題が繰り返し現れる</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="banner" hidden>
+          <span>エラーが発生しました。時間をおいて再度お試しください。</span>
+          <button class="btn-quiet" type="button">閉じる</button>
+        </div>
+        <form class="composer-inner">
+          <textarea placeholder="メッセージを入力（Markdown対応）" rows="1"></textarea>
+          <div class="composer-bar">
+            <span class="composer-hint">Enterで送信 / Shift+Enterで改行</span>
+            <button class="btn-quiet" type="button">入力をコピー</button>
+            <button class="btn btn-primary" type="submit">送信</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <script>
+      // ログイン処理
+      document.querySelector('form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        document.getElementById('login-view').classList.add('hidden');
+        document.getElementById('app-view').classList.remove('hidden');
+      });
+
+      // ログアウト処理
+      document.querySelectorAll('.btn-quiet').forEach(btn => {
+        if (btn.textContent === 'ログアウト') {
+          btn.addEventListener('click', () => {
+            document.getElementById('app-view').classList.add('hidden');
+            document.getElementById('login-view').classList.remove('hidden');
+            document.querySelector('input[type="password"]').value = '';
+          });
+        }
+      });
+    </script>
+  </body>
+</html>

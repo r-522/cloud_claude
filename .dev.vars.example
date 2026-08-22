@@ -1,0 +1,5 @@
+# File: .dev.vars.example
+# ローカル開発用テンプレート。コピーして .dev.vars として使う（.dev.vars はコミット禁止）
+CLAUDE_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SESSION_SECRET=32文字以上のランダムな文字列に置き換える
+ACCESS_CODE=1359

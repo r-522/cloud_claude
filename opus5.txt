@@ -1,0 +1,2649 @@
+
+```toml
+# File: wrangler.toml
+name = "claude-chat"
+main = "src/index.ts"
+compatibility_date = "2025-10-01"
+
+# 静的アセット（ログイン画面 / チャット UI）
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[observability]
+enabled = true
+
+# 秘密でない設定のみ vars に置く。
+# ANTHROPIC_API_KEY / SESSION_SECRET は必ず `wrangler secret put` で登録する。
+[vars]
+ACCESS_CODE = "1359"
+```
+
+```json
+// File: package.json
+{
+  "name": "claude-chat-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250927.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.42.0"
+  }
+}
+```
+
+```json
+// File: tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "WebWorker"],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": false,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["src", "test"]
+}
+```
+
+```typescript
+// File: vitest.config.ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    include: ['test/**/*.test.ts'],
+  },
+});
+```
+
+```bash
+# File: .dev.vars.example
+# ローカル開発用。実ファイル名は .dev.vars（Git 管理外）
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+SESSION_SECRET=ここに十分に長いランダム文字列を入れる
+ACCESS_CODE=1359
+```
+
+```bash
+# File: .gitignore
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+.DS_Store
+```
+
+```typescript
+// File: src/models.ts
+/**
+ * モデル定義と Messages API リクエストボディの組み立て。
+ *
+ * 参照した一次情報（Anthropic 公式ドキュメント）:
+ *  - Models overview            : docs.anthropic.com/en/docs/about-claude/models/overview
+ *  - Messages API リファレンス   : docs.anthropic.com/en/api/messages
+ *  - Extended thinking          : docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+ *
+ * 注意:
+ *  「Sonnet 5 / Opus 5」という名称のモデルは公式の Models overview に存在しないため、
+ *  実在する最新世代の ID（Claude 4.5 系）へ置き換えている。
+ *  新モデルが公開された場合は、下記 MODELS の `id` を公式 Models overview の
+ *  「Model名 / Model ID」表に合わせて更新するだけでよい（他のコード変更は不要）。
+ */
+
+export interface ModelDef {
+  /** Messages API の `model` に渡す ID */
+  id: string;
+  /** UI 表示名 */
+  label: string;
+  /** UI 補足説明 */
+  description: string;
+  /** モデルの最大出力トークン（安全側の上限として利用） */
+  maxOutputTokens: number;
+  /** Extended thinking に対応しているか */
+  supportsThinking: boolean;
+}
+
+export const MODELS: ModelDef[] = [
+  {
+    id: 'claude-haiku-4-5',
+    label: 'Haiku 4.5',
+    description: '高速・低コスト。日常的な質問や短い作業向け。',
+    maxOutputTokens: 64000,
+    supportsThinking: true,
+  },
+  {
+    id: 'claude-sonnet-4-5',
+    label: 'Sonnet 4.5',
+    description: 'バランス型。長文作成やコーディングの標準選択。',
+    maxOutputTokens: 64000,
+    supportsThinking: true,
+  },
+  {
+    id: 'claude-opus-4-5',
+    label: 'Opus 4.5',
+    description: '最も高性能。複雑な推論・設計・分析向け。',
+    maxOutputTokens: 64000,
+    supportsThinking: true,
+  },
+];
+
+export interface EffortLevel {
+  id: string;
+  label: string;
+  /** Extended thinking の budget_tokens（0 は thinking 無効） */
+  budgetTokens: number;
+}
+
+/**
+ * UI の「推論量（effort）」。
+ * 公式に仕様が確定している `thinking.budget_tokens`（Extended thinking）へマッピングする。
+ * 推測に基づく非公開パラメータは送信しない。
+ */
+export const EFFORT_LEVELS: EffortLevel[] = [
+  { id: 'off', label: '標準（思考なし）', budgetTokens: 0 },
+  { id: 'low', label: '低', budgetTokens: 2048 },
+  { id: 'medium', label: '中', budgetTokens: 6144 },
+  { id: 'high', label: '高', budgetTokens: 12288 },
+];
+
+/** thinking を使わない場合のベース出力トークン数 */
+export const BASE_MAX_OUTPUT_TOKENS = 4096;
+
+export const DEFAULT_SYSTEM_PROMPT =
+  'You are a helpful assistant in a chat application. ' +
+  'Answer in the same language as the user. ' +
+  'Format answers with GitHub-flavored Markdown, and always use fenced code blocks with a language tag for code.';
+
+export function findModel(id: unknown): ModelDef | undefined {
+  return MODELS.find((m) => m.id === id);
+}
+
+export function findEffort(id: unknown): EffortLevel | undefined {
+  return EFFORT_LEVELS.find((e) => e.id === id);
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface BuildRequestInput {
+  model: ModelDef;
+  effort: EffortLevel;
+  messages: ChatMessage[];
+  system?: string;
+}
+
+export interface AnthropicRequestBody {
+  model: string;
+  max_tokens: number;
+  stream: true;
+  system: string;
+  messages: ChatMessage[];
+  thinking?: { type: 'enabled'; budget_tokens: number };
+  temperature?: number;
+}
+
+/**
+ * Messages API のリクエストボディを組み立てる。
+ * - thinking 有効時は max_tokens > budget_tokens を必ず満たす
+ * - thinking 有効時に temperature は指定しない（公式仕様上、非対応のため）
+ */
+export function buildRequestBody(input: BuildRequestInput): AnthropicRequestBody {
+  const { model, effort, messages } = input;
+  const useThinking = model.supportsThinking && effort.budgetTokens > 0;
+
+  const maxTokens = useThinking
+    ? Math.min(model.maxOutputTokens, BASE_MAX_OUTPUT_TOKENS + effort.budgetTokens)
+    : Math.min(model.maxOutputTokens, BASE_MAX_OUTPUT_TOKENS);
+
+  const body: AnthropicRequestBody = {
+    model: model.id,
+    max_tokens: maxTokens,
+    stream: true,
+    system: input.system ?? DEFAULT_SYSTEM_PROMPT,
+    messages,
+  };
+
+  if (useThinking) {
+    body.thinking = { type: 'enabled', budget_tokens: effort.budgetTokens };
+  } else {
+    body.temperature = 1;
+  }
+
+  return body;
+}
+```
+
+```typescript
+// File: src/auth.ts
+/**
+ * 簡易アクセス制限用のセッション。
+ * HMAC-SHA256 で署名した短命トークンを HttpOnly Cookie に格納する。
+ * API キー等の秘密情報はクライアントへ一切渡さない。
+ */
+
+const encoder = new TextEncoder();
+
+export const SESSION_COOKIE = 'cc_session';
+export const SESSION_TTL_SECONDS = 60 * 60 * 12;
+
+export function timingSafeEqual(a: string, b: string): boolean {
+  const ab = encoder.encode(a);
+  const bb = encoder.encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function hmac(secret: string, data: string): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
+  return new Uint8Array(sig);
+}
+
+export async function createSessionToken(
+  secret: string,
+  nowMs: number = Date.now(),
+  ttlSeconds: number = SESSION_TTL_SECONDS,
+): Promise<string> {
+  const payload = JSON.stringify({ v: 1, exp: Math.floor(nowMs / 1000) + ttlSeconds });
+  const encoded = toBase64Url(encoder.encode(payload));
+  const signature = toBase64Url(await hmac(secret, encoded));
+  return `${encoded}.${signature}`;
+}
+
+export async function verifySessionToken(
+  token: string | undefined | null,
+  secret: string,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  if (!token || !secret) return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [encoded, signature] = parts;
+
+  const expected = toBase64Url(await hmac(secret, encoded));
+  if (!timingSafeEqual(signature, expected)) return false;
+
+  try {
+    const raw = atob(encoded.replace(/-/g, '+').replace(/_/g, '/'));
+    const payload = JSON.parse(raw) as { exp?: number };
+    if (typeof payload.exp !== 'number') return false;
+    return payload.exp * 1000 > nowMs;
+  } catch {
+    return false;
+  }
+}
+
+export function parseCookies(header: string | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const name = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (name) out[name] = decodeURIComponent(value);
+  }
+  return out;
+}
+
+export function buildSessionCookie(token: string, secure: boolean): string {
+  const attrs = [
+    `${SESSION_COOKIE}=${token}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${SESSION_TTL_SECONDS}`,
+  ];
+  if (secure) attrs.push('Secure');
+  return attrs.join('; ');
+}
+
+export function clearSessionCookie(secure: boolean): string {
+  const attrs = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (secure) attrs.push('Secure');
+  return attrs.join('; ');
+}
+```
+
+```typescript
+// File: src/anthropic.ts
+/**
+ * Anthropic Messages API 呼び出しと SSE パース。
+ * 参照: docs.anthropic.com/en/api/messages, docs.anthropic.com/en/docs/build-with-claude/streaming
+ */
+import type { AnthropicRequestBody } from './models';
+
+export const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+export const ANTHROPIC_VERSION = '2023-06-01';
+
+export function callAnthropic(apiKey: string, body: AnthropicRequestBody): Promise<Response> {
+  return fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'text/event-stream',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+export interface SSEEvent {
+  event: string;
+  data: string;
+}
+
+/** SSE ストリームを 1 イベントずつ取り出す */
+export async function* parseSSE(stream: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sep = buffer.indexOf('\n\n');
+      while (sep !== -1) {
+        const chunk = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const parsed = parseChunk(chunk);
+        if (parsed) yield parsed;
+        sep = buffer.indexOf('\n\n');
+      }
+    }
+    const rest = parseChunk(buffer);
+    if (rest) yield rest;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function parseChunk(chunk: string): SSEEvent | null {
+  const trimmed = chunk.replace(/\r/g, '').trim();
+  if (!trimmed) return null;
+  let event = 'message';
+  const dataLines: string[] = [];
+  for (const line of trimmed.split('\n')) {
+    if (line.startsWith(':')) continue;
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if (!dataLines.length) return null;
+  return { event, data: dataLines.join('\n') };
+}
+
+/** 上流のステータスコードを、内部情報を含まないユーザー向け文言へ変換する */
+export function friendlyUpstreamError(status: number): string {
+  if (status === 400) return 'リクエストの内容が受け付けられませんでした。入力を短くして再試行してください。';
+  if (status === 401 || status === 403) return 'サーバー側の設定に問題があります。管理者にお問い合わせください。';
+  if (status === 404) return '指定されたモデルを利用できません。別のモデルを選択してください。';
+  if (status === 413) return '入力が長すぎます。会話を新しく開始するか、内容を短くしてください。';
+  if (status === 429) return '現在混み合っています。しばらく待ってから再試行してください。';
+  if (status === 529) return 'サービスが一時的に混雑しています。時間をおいて再試行してください。';
+  if (status >= 500) return '応答の生成に失敗しました。時間をおいて再試行してください。';
+  return '応答の生成に失敗しました。時間をおいて再試行してください。';
+}
+```
+
+```typescript
+// File: src/index.ts
+import {
+  SESSION_COOKIE,
+  buildSessionCookie,
+  clearSessionCookie,
+  createSessionToken,
+  parseCookies,
+  timingSafeEqual,
+  verifySessionToken,
+} from './auth';
+import {
+  EFFORT_LEVELS,
+  MODELS,
+  buildRequestBody,
+  findEffort,
+  findModel,
+  type ChatMessage,
+} from './models';
+import { callAnthropic, friendlyUpstreamError, parseSSE } from './anthropic';
+
+export interface Env {
+  ANTHROPIC_API_KEY?: string;
+  ACCESS_CODE?: string;
+  SESSION_SECRET?: string;
+  ASSETS: { fetch: (request: Request) => Promise<Response> };
+}
+
+const MAX_MESSAGES = 40;
+const MAX_TOTAL_CHARS = 60_000;
+const DEFAULT_ACCESS_CODE = '1359';
+
+function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...extraHeaders,
+    },
+  });
+}
+
+function isSecure(url: URL): boolean {
+  return url.protocol === 'https:';
+}
+
+async function hasValidSession(request: Request, env: Env): Promise<boolean> {
+  if (!env.SESSION_SECRET) return false;
+  const cookies = parseCookies(request.headers.get('cookie'));
+  return verifySessionToken(cookies[SESSION_COOKIE], env.SESSION_SECRET);
+}
+
+type ValidationResult =
+  | { ok: true; modelId: string; effortId: string; messages: ChatMessage[] }
+  | { ok: false; error: string };
+
+export function validateChatPayload(payload: unknown): ValidationResult {
+  if (typeof payload !== 'object' || payload === null) {
+    return { ok: false, error: 'リクエストの形式が正しくありません。' };
+  }
+  const body = payload as Record<string, unknown>;
+
+  if (!findModel(body.model)) {
+    return { ok: false, error: '選択されたモデルは利用できません。' };
+  }
+  const effortId = typeof body.effort === 'string' ? body.effort : 'off';
+  if (!findEffort(effortId)) {
+    return { ok: false, error: '推論量の指定が正しくありません。' };
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return { ok: false, error: 'メッセージが空です。' };
+  }
+  if (body.messages.length > MAX_MESSAGES) {
+    return { ok: false, error: '会話が長くなりすぎました。新しい会話を開始してください。' };
+  }
+
+  const messages: ChatMessage[] = [];
+  let total = 0;
+  for (const raw of body.messages) {
+    if (typeof raw !== 'object' || raw === null) {
+      return { ok: false, error: 'メッセージの形式が正しくありません。' };
+    }
+    const m = raw as Record<string, unknown>;
+    if (m.role !== 'user' && m.role !== 'assistant') {
+      return { ok: false, error: 'メッセージの形式が正しくありません。' };
+    }
+    if (typeof m.content !== 'string' || m.content.trim() === '') {
+      return { ok: false, error: '空のメッセージは送信できません。' };
+    }
+    total += m.content.length;
+    messages.push({ role: m.role, content: m.content });
+  }
+  if (total > MAX_TOTAL_CHARS) {
+    return { ok: false, error: '入力が長すぎます。会話を新しく開始するか、内容を短くしてください。' };
+  }
+  if (messages[messages.length - 1].role !== 'user') {
+    return { ok: false, error: 'メッセージの順序が正しくありません。' };
+  }
+
+  return { ok: true, modelId: body.model as string, effortId, messages };
+}
+
+/** 上流 SSE を、クライアント向けの最小限のイベントへ変換する */
+export function toClientStream(upstream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (obj: unknown) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      let stopReason: string | null = null;
+      let sentDone = false;
+
+      try {
+        for await (const ev of parseSSE(upstream)) {
+          if (ev.event === 'ping') continue;
+
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(ev.data) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+
+          switch (parsed.type) {
+            case 'content_block_delta': {
+              const delta = parsed.delta as Record<string, unknown> | undefined;
+              if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+                send({ type: 'text', text: delta.text });
+              } else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+                send({ type: 'thinking', text: delta.thinking });
+              }
+              break;
+            }
+            case 'message_delta': {
+              const delta = parsed.delta as Record<string, unknown> | undefined;
+              if (typeof delta?.stop_reason === 'string') stopReason = delta.stop_reason;
+              break;
+            }
+            case 'message_stop': {
+              send({ type: 'done', stopReason });
+              sentDone = true;
+              break;
+            }
+            case 'error': {
+              console.error('anthropic stream error', JSON.stringify(parsed).slice(0, 500));
+              send({ type: 'error', message: '応答の生成中にエラーが発生しました。' });
+              sentDone = true;
+              break;
+            }
+            default:
+              break;
+          }
+        }
+        if (!sentDone) send({ type: 'done', stopReason });
+      } catch (err) {
+        console.error('stream relay failed', err);
+        try {
+          send({ type: 'error', message: '通信が中断されました。再試行してください。' });
+        } catch {
+          /* controller already closed */
+        }
+      } finally {
+        controller.close();
+      }
+    },
+  });
+}
+
+async function handleLogin(request: Request, env: Env, url: URL): Promise<Response> {
+  if (!env.SESSION_SECRET) {
+    console.error('SESSION_SECRET is not configured');
+    return json({ error: 'サーバーの設定が完了していません。管理者にお問い合わせください。' }, 500);
+  }
+
+  let body: { code?: unknown };
+  try {
+    body = (await request.json()) as { code?: unknown };
+  } catch {
+    return json({ error: 'リクエストの形式が正しくありません。' }, 400);
+  }
+
+  const input = typeof body.code === 'string' ? body.code.trim() : '';
+  const expected = env.ACCESS_CODE || DEFAULT_ACCESS_CODE;
+
+  if (!input || !timingSafeEqual(input, expected)) {
+    // 総当たりへの気休め程度の緩和
+    await new Promise((r) => setTimeout(r, 400));
+    return json({ error: 'アクセスコードが正しくありません。' }, 401);
+  }
+
+  const token = await createSessionToken(env.SESSION_SECRET);
+  return json({ ok: true }, 200, { 'set-cookie': buildSessionCookie(token, isSecure(url)) });
+}
+
+async function handleChat(request: Request, env: Env): Promise<Response> {
+  if (!env.ANTHROPIC_API_KEY) {
+    console.error('ANTHROPIC_API_KEY is not configured');
+    return json({ error: 'サーバーの設定が完了していません。管理者にお問い合わせください。' }, 500);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: 'リクエストの形式が正しくありません。' }, 400);
+  }
+
+  const validated = validateChatPayload(payload);
+  if (!validated.ok) return json({ error: validated.error }, 400);
+
+  const model = findModel(validated.modelId)!;
+  const effort = findEffort(validated.effortId)!;
+  const requestBody = buildRequestBody({ model, effort, messages: validated.messages });
+
+  let upstream: Response;
+  try {
+    upstream = await callAnthropic(env.ANTHROPIC_API_KEY, requestBody);
+  } catch (err) {
+    console.error('upstream fetch failed', err);
+    return json({ error: 'Claude API に接続できませんでした。時間をおいて再試行してください。' }, 502);
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    const detail = await upstream.text().catch(() => '');
+    console.error('upstream error', upstream.status, detail.slice(0, 500));
+    return json({ error: friendlyUpstreamError(upstream.status) }, upstream.status === 429 ? 429 : 502);
+  }
+
+  return new Response(toClientStream(upstream.body), {
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-store, no-transform',
+      'x-accel-buffering': 'no',
+    },
+  });
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (!url.pathname.startsWith('/api/')) {
+      return env.ASSETS.fetch(request);
+    }
+
+    try {
+      if (url.pathname === '/api/login' && request.method === 'POST') {
+        return await handleLogin(request, env, url);
+      }
+
+      if (url.pathname === '/api/logout' && request.method === 'POST') {
+        return json({ ok: true }, 200, { 'set-cookie': clearSessionCookie(isSecure(url)) });
+      }
+
+      if (url.pathname === '/api/session' && request.method === 'GET') {
+        return json({ authenticated: await hasValidSession(request, env) });
+      }
+
+      const authed = await hasValidSession(request, env);
+      if (!authed) {
+        return json({ error: '認証が必要です。もう一度ログインしてください。' }, 401);
+      }
+
+      if (url.pathname === '/api/models' && request.method === 'GET') {
+        return json({
+          models: MODELS.map(({ id, label, description, supportsThinking }) => ({
+            id,
+            label,
+            description,
+            supportsThinking,
+          })),
+          efforts: EFFORT_LEVELS.map(({ id, label }) => ({ id, label })),
+        });
+      }
+
+      if (url.pathname === '/api/chat' && request.method === 'POST') {
+        return await handleChat(request, env);
+      }
+
+      return json({ error: '要求されたリソースが見つかりません。' }, 404);
+    } catch (err) {
+      console.error('unhandled error', err);
+      return json({ error: '予期しないエラーが発生しました。時間をおいて再試行してください。' }, 500);
+    }
+  },
+};
+```
+
+```javascript
+// File: public/markdown.js
+/**
+ * 依存関係なしの軽量 Markdown レンダラ。
+ * すべての入力を先に HTML エスケープしてから構造を組み立てるため、
+ * 生の HTML が出力に混入することはない（XSS 対策）。
+ */
+
+const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+export function escapeHtml(input) {
+  return String(input ?? '').replace(/[&<>"']/g, (ch) => ESCAPE_MAP[ch]);
+}
+
+function safeUrl(raw) {
+  const url = String(raw).trim();
+  if (/^(?:https?:\/\/|mailto:)/i.test(url)) return url;
+  if (/^[#/]/.test(url)) return url;
+  return null;
+}
+
+function applyEmphasis(text) {
+  return text
+    .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/~~([\s\S]+?)~~/g, '<del>$1</del>')
+    .replace(/\*([^\s*][\s\S]*?)\*/g, '<em>$1</em>');
+}
+
+export function renderInline(text, options = {}) {
+  const breaks = options.breaks === true;
+  const codeSpans = [];
+  const links = [];
+
+  // 1. コードスパンを退避（内部は後続の変換対象外）
+  let out = String(text ?? '').replace(/(`+)([\s\S]+?)\1/g, (_m, _ticks, body) => {
+    codeSpans.push(escapeHtml(body.replace(/^ (.*) $/, '$1')));
+    return `\u0000C${codeSpans.length - 1}\u0000`;
+  });
+
+  // 2. エスケープ
+  out = escapeHtml(out);
+
+  // 3. リンクを退避
+  out = out.replace(/!?\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g, (match, label, href) => {
+    const url = safeUrl(href.replace(/&amp;/g, '&'));
+    if (!url) return match;
+    links.push({ href: escapeHtml(url), label });
+    return `\u0000L${links.length - 1}\u0000`;
+  });
+
+  // 4. 強調
+  out = applyEmphasis(out);
+
+  // 5. 改行
+  if (breaks) out = out.replace(/\n/g, '<br>');
+
+  // 6. 復元
+  out = out.replace(/\u0000L(\d+)\u0000/g, (_m, i) => {
+    const link = links[Number(i)];
+    return `<a href="${link.href}" target="_blank" rel="noopener noreferrer">${applyEmphasis(link.label)}</a>`;
+  });
+  out = out.replace(/\u0000C(\d+)\u0000/g, (_m, i) => `<code>${codeSpans[Number(i)]}</code>`);
+
+  return out;
+}
+
+const RE_FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)\s*$/;
+const RE_HEADING = /^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+const RE_HR = /^ {0,3}([-*_])\s*(?:\1\s*){2,}$/;
+const RE_QUOTE = /^ {0,3}>\s?/;
+const RE_LIST = /^( *)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+
+function startsNewBlock(line) {
+  return (
+    !line.trim() ||
+    RE_FENCE.test(line) ||
+    RE_HEADING.test(line) ||
+    RE_HR.test(line) ||
+    RE_QUOTE.test(line) ||
+    RE_LIST.test(line)
+  );
+}
+
+function isTableSeparator(line) {
+  return /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-') && line.includes('|');
+}
+
+function splitRow(line) {
+  return line
+    .replace(/^\s*\|/, '')
+    .replace(/\|\s*$/, '')
+    .split('|')
+    .map((cell) => cell.trim());
+}
+
+export function renderMarkdown(source) {
+  const lines = String(source ?? '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n');
+  return parseBlocks(lines);
+}
+
+function parseBlocks(lines) {
+  const html = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+
+    // фenced code block
+    const fence = line.match(RE_FENCE);
+    if (fence) {
+      const marker = fence[1][0];
+      const len = fence[1].length;
+      const lang = fence[2] || '';
+      const closing = new RegExp(`^ {0,3}\\${marker}{${len},}\\s*$`);
+      const body = [];
+      i++;
+      while (i < lines.length && !closing.test(lines[i])) {
+        body.push(lines[i]);
+        i++;
+      }
+      i++;
+      const cls = /^[\w+.#-]+$/.test(lang) ? ` class="language-${escapeHtml(lang)}"` : '';
+      const label = /^[\w+.#-]+$/.test(lang) ? ` data-lang="${escapeHtml(lang)}"` : '';
+      html.push(`<pre${label}><code${cls}>${escapeHtml(body.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    // heading
+    const heading = line.match(RE_HEADING);
+    if (heading) {
+      const level = heading[1].length;
+      html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // horizontal rule
+    if (RE_HR.test(line)) {
+      html.push('<hr>');
+      i++;
+      continue;
+    }
+
+    // blockquote
+    if (RE_QUOTE.test(line)) {
+      const buf = [];
+      while (i < lines.length && (RE_QUOTE.test(lines[i]) || (lines[i].trim() && buf.length))) {
+        if (!RE_QUOTE.test(lines[i]) && !lines[i].trim()) break;
+        buf.push(lines[i].replace(RE_QUOTE, ''));
+        i++;
+      }
+      html.push(`<blockquote>${parseBlocks(buf)}</blockquote>`);
+      continue;
+    }
+
+    // table
+    if (line.includes('|') && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const header = splitRow(line);
+      const aligns = splitRow(lines[i + 1]).map((cell) => {
+        const left = cell.startsWith(':');
+        const right = cell.endsWith(':');
+        if (left && right) return ' style="text-align:center"';
+        if (right) return ' style="text-align:right"';
+        if (left) return ' style="text-align:left"';
+        return '';
+      });
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitRow(lines[i]));
+        i++;
+      }
+      const thead = header.map((c, idx) => `<th${aligns[idx] || ''}>${renderInline(c)}</th>`).join('');
+      const tbody = rows
+        .map(
+          (row) =>
+            `<tr>${header
+              .map((_h, idx) => `<td${aligns[idx] || ''}>${renderInline(row[idx] ?? '')}</td>`)
+              .join('')}</tr>`,
+        )
+        .join('');
+      html.push(`<div class="table-wrap"><table><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table></div>`);
+      continue;
+    }
+
+    // list
+    const listStart = line.match(RE_LIST);
+    if (listStart) {
+      const baseIndent = listStart[1].length;
+      const ordered = /^\d/.test(listStart[2]);
+      const items = [];
+      let current = null;
+
+      while (i < lines.length) {
+        const l = lines[i];
+
+        if (!l.trim()) {
+          const next = lines[i + 1];
+          if (next && (/^ {2,}\S/.test(next) || RE_LIST.test(next))) {
+            if (current) current.lines.push('');
+            i++;
+            continue;
+          }
+          break;
+        }
+
+        const m = l.match(RE_LIST);
+        if (m && m[1].length <= baseIndent + 1) {
+          current = { lines: [m[3]], loose: false };
+          items.push(current);
+          i++;
+          continue;
+        }
+        if (current && (m || /^ {2,}\S/.test(l))) {
+          current.lines.push(l.replace(new RegExp(`^ {0,${baseIndent + 2}}`), ''));
+          i++;
+          continue;
+        }
+        break;
+      }
+
+      const rendered = items
+        .map((item) => {
+          const tight = !item.lines.some((l) => l.trim() === '');
+          let inner = parseBlocks(item.lines);
+          if (tight) inner = inner.replace(/^<p>([\s\S]*?)<\/p>/, '$1');
+          return `<li>${inner}</li>`;
+        })
+        .join('');
+
+      const startAttr =
+        ordered && listStart[2] !== '1.' && listStart[2] !== '1)'
+          ? ` start="${parseInt(listStart[2], 10)}"`
+          : '';
+      html.push(ordered ? `<ol${startAttr}>${rendered}</ol>` : `<ul>${rendered}</ul>`);
+      continue;
+    }
+
+    // paragraph
+    const buf = [line];
+    i++;
+    while (i < lines.length && !startsNewBlock(lines[i])) {
+      buf.push(lines[i]);
+      i++;
+    }
+    html.push(`<p>${renderInline(buf.join('\n'), { breaks: true })}</p>`);
+  }
+
+  return html.join('\n');
+}
+```
+
+```css
+/* File: public/styles.css */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --bg-subtle: #f6f7f8;
+  --bg-inset: #f0f1f3;
+  --fg: #1b1c1e;
+  --fg-muted: #62666d;
+  --fg-faint: #8a8f97;
+  --border: #e2e4e8;
+  --border-strong: #cfd3d9;
+  --accent: #2f5bd0;
+  --danger: #b3261e;
+  --radius: 6px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", "Hiragino Sans",
+    "Noto Sans JP", Meiryo, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181b;
+    --bg-subtle: #1c1f23;
+    --bg-inset: #22262b;
+    --fg: #e6e8ea;
+    --fg-muted: #a2a8b0;
+    --fg-faint: #7d848c;
+    --border: #2c3138;
+    --border-strong: #3b424a;
+    --accent: #7fa4f5;
+    --danger: #f2857d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.7;
+  -webkit-text-size-adjust: 100%;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ---------- ログイン ---------- */
+
+.login {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+}
+
+.login-card h1 {
+  font-size: 20px;
+  letter-spacing: -0.01em;
+  margin: 0 0 6px;
+}
+
+.login-card .lead {
+  margin: 0 0 24px;
+  color: var(--fg-muted);
+  font-size: 14px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.hint {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--fg-faint);
+}
+
+input[type='password'],
+input[type='text'],
+textarea,
+select {
+  width: 100%;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 9px 11px;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn {
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--fg);
+  border-radius: var(--radius);
+  padding: 8px 14px;
+  font-size: 14px;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--fg);
+  color: var(--bg);
+  border-color: var(--fg);
+}
+
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.88;
+  background: var(--fg);
+}
+
+.btn-block {
+  width: 100%;
+  margin-top: 16px;
+}
+
+.btn-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 4px 8px;
+  font-size: 12.5px;
+  border-radius: 4px;
+}
+
+.btn-quiet:hover:not(:disabled) {
+  background: var(--bg-inset);
+  color: var(--fg);
+}
+
+.form-error {
+  margin-top: 14px;
+  color: var(--danger);
+  font-size: 13px;
+  min-height: 1.2em;
+}
+
+/* ---------- アプリ ---------- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.topbar {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex: none;
+}
+
+.topbar-inner {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.brand {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin-right: auto;
+}
+
+.control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+
+.control select {
+  width: auto;
+  padding: 5px 8px;
+  font-size: 13px;
+  border-color: var(--border);
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.messages-inner {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 8px 16px 40px;
+}
+
+.empty {
+  color: var(--fg-faint);
+  font-size: 14px;
+  padding: 48px 0;
+  text-align: center;
+}
+
+.msg {
+  padding: 18px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.msg:last-child {
+  border-bottom: none;
+}
+
+.msg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.msg-role {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.msg-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.msg-user .msg-body {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.msg-body > *:first-child {
+  margin-top: 0;
+}
+
+.msg-body > *:last-child {
+  margin-bottom: 0;
+}
+
+.thinking {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  font-size: 13.5px;
+}
+
+.thinking summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+}
+
+.thinking .thinking-body {
+  padding: 0 10px 10px;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+}
+
+.caret::after {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -0.2em;
+  background: var(--fg-muted);
+  animation: blink 1.1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* Markdown */
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  line-height: 1.35;
+  margin: 1.4em 0 0.5em;
+  letter-spacing: -0.01em;
+}
+
+.md h1 {
+  font-size: 1.35em;
+}
+.md h2 {
+  font-size: 1.2em;
+}
+.md h3 {
+  font-size: 1.08em;
+}
+.md h4 {
+  font-size: 1em;
+}
+
+.md p {
+  margin: 0.7em 0;
+}
+
+.md ul,
+.md ol {
+  margin: 0.7em 0;
+  padding-left: 1.5em;
+}
+
+.md li {
+  margin: 0.25em 0;
+}
+
+.md blockquote {
+  margin: 0.8em 0;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--fg-muted);
+}
+
+.md hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.4em 0;
+}
+
+.md a {
+  color: var(--accent);
+}
+
+.md code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+
+.md pre {
+  position: relative;
+  margin: 0.9em 0;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+
+.md pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12.8px;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+.code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  font-size: 11.5px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.md pre:hover .code-copy,
+.code-copy:focus-visible {
+  opacity: 1;
+}
+
+@media (pointer: coarse) {
+  .code-copy {
+    opacity: 1;
+  }
+}
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 0.9em 0;
+}
+
+.md table {
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 100%;
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.md th {
+  background: var(--bg-subtle);
+  font-weight: 650;
+}
+
+/* ---------- 入力欄 ---------- */
+
+.composer {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.composer-inner {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 12px 16px 14px;
+}
+
+.composer textarea {
+  resize: none;
+  min-height: 46px;
+  max-height: 40dvh;
+  line-height: 1.6;
+  overflow-y: auto;
+}
+
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.composer-hint {
+  font-size: 12px;
+  color: var(--fg-faint);
+  margin-right: auto;
+}
+
+.banner {
+  max-width: 780px;
+  margin: 0 auto 8px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--danger);
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.banner button {
+  margin-left: auto;
+  color: inherit;
+}
+
+@media (max-width: 600px) {
+  body {
+    font-size: 15px;
+  }
+  .topbar-inner {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+  .brand {
+    width: 100%;
+    margin-right: 0;
+  }
+  .control {
+    flex: 1 1 auto;
+  }
+  .control select {
+    flex: 1;
+    width: 100%;
+  }
+  .messages-inner,
+  .composer-inner {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .composer-hint {
+    display: none;
+  }
+}
+```
+
+```html
+<!-- File: public/index.html -->
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Claude Chat</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <!-- ログイン -->
+    <section class="login" id="login-view">
+      <div class="login-card">
+        <h1>Claude Chat</h1>
+        <p class="lead">続けるにはアクセスコードを入力してください。</p>
+        <form id="login-form" autocomplete="off" novalidate>
+          <label class="field" for="access-code">アクセスコード</label>
+          <input
+            id="access-code"
+            name="access-code"
+            type="password"
+            inputmode="text"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            required
+          />
+          <p class="hint">8 文字以上で、アルファベット大文字・小文字・数字・記号をそれぞれ 1 文字以上含めてください。</p>
+          <button class="btn btn-primary btn-block" type="submit" id="login-submit">ログイン</button>
+          <p class="form-error" id="login-error" role="alert"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- チャット -->
+    <section class="app" id="app-view" hidden>
+      <header class="topbar">
+        <div class="topbar-inner">
+          <div class="brand">Claude Chat</div>
+          <div class="control">
+            <label for="model-select">モデル</label>
+            <select id="model-select"></select>
+          </div>
+          <div class="control" id="effort-control">
+            <label for="effort-select">推論量</label>
+            <select id="effort-select"></select>
+          </div>
+          <button class="btn-quiet" type="button" id="new-chat">新しい会話</button>
+          <button class="btn-quiet" type="button" id="logout">ログアウト</button>
+        </div>
+      </header>
+
+      <div class="messages" id="messages">
+        <div class="messages-inner" id="messages-inner">
+          <p class="empty" id="empty-state">メッセージを入力して会話を開始します。</p>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="banner" id="error-banner" role="alert" hidden>
+          <span id="error-text"></span>
+          <button class="btn-quiet" type="button" id="error-dismiss">閉じる</button>
+        </div>
+        <form class="composer-inner" id="composer">
+          <textarea
+            id="input"
+            rows="1"
+            placeholder="メッセージを入力（Markdown 対応）"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <div class="composer-bar">
+            <span class="composer-hint" id="send-hint">Enter で送信 / Shift + Enter で改行</span>
+            <button class="btn-quiet" type="button" id="copy-input">入力をコピー</button>
+            <button class="btn" type="button" id="stop" hidden>停止</button>
+            <button class="btn btn-primary" type="submit" id="send">送信</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
+```
+
+```javascript
+// File: public/app.js
+import { renderMarkdown } from './markdown.js';
+
+const $ = (selector) => document.querySelector(selector);
+
+const els = {
+  loginView: $('#login-view'),
+  loginForm: $('#login-form'),
+  loginError: $('#login-error'),
+  loginSubmit: $('#login-submit'),
+  accessCode: $('#access-code'),
+  appView: $('#app-view'),
+  modelSelect: $('#model-select'),
+  effortSelect: $('#effort-select'),
+  effortControl: $('#effort-control'),
+  newChat: $('#new-chat'),
+  logout: $('#logout'),
+  messages: $('#messages'),
+  messagesInner: $('#messages-inner'),
+  emptyState: $('#empty-state'),
+  composer: $('#composer'),
+  input: $('#input'),
+  send: $('#send'),
+  stop: $('#stop'),
+  copyInput: $('#copy-input'),
+  sendHint: $('#send-hint'),
+  errorBanner: $('#error-banner'),
+  errorText: $('#error-text'),
+  errorDismiss: $('#error-dismiss'),
+};
+
+const state = {
+  models: [],
+  efforts: [],
+  turns: [],
+  streaming: false,
+  controller: null,
+};
+
+const isTouch = window.matchMedia('(pointer: coarse)').matches;
+if (isTouch) els.sendHint.textContent = '';
+
+/* ---------- 共通 ---------- */
+
+function showError(message) {
+  els.errorText.textContent = message;
+  els.errorBanner.hidden = false;
+}
+
+function clearError() {
+  els.errorBanner.hidden = true;
+  els.errorText.textContent = '';
+}
+
+async function copyText(text, button) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    if (button) {
+      const original = button.dataset.label || button.textContent;
+      button.dataset.label = original;
+      button.textContent = 'コピーしました';
+      setTimeout(() => {
+        button.textContent = button.dataset.label;
+      }, 1200);
+    }
+  } catch {
+    showError('クリップボードにコピーできませんでした。');
+  }
+}
+
+/* ---------- 認証 ---------- */
+
+async function checkSession() {
+  try {
+    const res = await fetch('/api/session', { credentials: 'same-origin' });
+    const data = await res.json();
+    return data.authenticated === true;
+  } catch {
+    return false;
+  }
+}
+
+function enterApp() {
+  els.loginView.hidden = true;
+  els.appView.hidden = false;
+  els.input.focus();
+}
+
+function enterLogin() {
+  els.appView.hidden = true;
+  els.loginView.hidden = false;
+  els.accessCode.value = '';
+  els.accessCode.focus();
+}
+
+els.loginForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  els.loginError.textContent = '';
+  els.loginSubmit.disabled = true;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ code: els.accessCode.value }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      els.loginError.textContent = data.error || 'ログインに失敗しました。';
+      return;
+    }
+    await loadConfig();
+    enterApp();
+  } catch {
+    els.loginError.textContent = 'ネットワークエラーが発生しました。';
+  } finally {
+    els.loginSubmit.disabled = false;
+  }
+});
+
+els.logout.addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+  state.turns = [];
+  renderMessages();
+  enterLogin();
+});
+
+/* ---------- 設定 ---------- */
+
+async function loadConfig() {
+  const res = await fetch('/api/models', { credentials: 'same-origin' });
+  if (!res.ok) throw new Error('config');
+  const data = await res.json();
+  state.models = data.models;
+  state.efforts = data.efforts;
+
+  els.modelSelect.innerHTML = '';
+  for (const model of state.models) {
+    const option = document.createElement('option');
+    option.value = model.id;
+    option.textContent = model.label;
+    option.title = model.description;
+    els.modelSelect.appendChild(option);
+  }
+  els.effortSelect.innerHTML = '';
+  for (const effort of state.efforts) {
+    const option = document.createElement('option');
+    option.value = effort.id;
+    option.textContent = effort.label;
+    els.effortSelect.appendChild(option);
+  }
+
+  const savedModel = localStorage.getItem('cc.model');
+  if (savedModel && state.models.some((m) => m.id === savedModel)) els.modelSelect.value = savedModel;
+  const savedEffort = localStorage.getItem('cc.effort');
+  if (savedEffort && state.efforts.some((e) => e.id === savedEffort)) els.effortSelect.value = savedEffort;
+
+  syncEffortAvailability();
+}
+
+function syncEffortAvailability() {
+  const model = state.models.find((m) => m.id === els.modelSelect.value);
+  els.effortControl.hidden = !model || !model.supportsThinking;
+}
+
+els.modelSelect.addEventListener('change', () => {
+  localStorage.setItem('cc.model', els.modelSelect.value);
+  syncEffortAvailability();
+});
+
+els.effortSelect.addEventListener('change', () => {
+  localStorage.setItem('cc.effort', els.effortSelect.value);
+});
+
+/* ---------- 描画 ---------- */
+
+function decorateCodeBlocks(container) {
+  for (const pre of container.querySelectorAll('pre')) {
+    if (pre.querySelector('.code-copy')) continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'code-copy';
+    button.textContent = 'コピー';
+    button.addEventListener('click', () => {
+      const code = pre.querySelector('code');
+      copyText(code ? code.textContent : '', button);
+    });
+    pre.appendChild(button);
+  }
+}
+
+function buildMessageNode(turn, index) {
+  const article = document.createElement('article');
+  article.className = `msg msg-${turn.role}`;
+  article.dataset.index = String(index);
+
+  const head = document.createElement('div');
+  head.className = 'msg-head';
+
+  const role = document.createElement('span');
+  role.className = 'msg-role';
+  role.textContent = turn.role === 'user' ? 'You' : 'Claude';
+  head.appendChild(role);
+
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+  const copyButton = document.createElement('button');
+  copyButton.type = 'button';
+  copyButton.className = 'btn-quiet';
+  copyButton.textContent = 'コピー';
+  copyButton.addEventListener('click', () => copyText(turn.content, copyButton));
+  actions.appendChild(copyButton);
+  head.appendChild(actions);
+
+  article.appendChild(head);
+
+  if (turn.role === 'assistant' && turn.thinking) {
+    const details = document.createElement('details');
+    details.className = 'thinking';
+    const summary = document.createElement('summary');
+    summary.textContent = '思考の要約を表示';
+    const body = document.createElement('div');
+    body.className = 'thinking-body';
+    body.textContent = turn.thinking;
+    details.append(summary, body);
+    article.appendChild(details);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'msg-body md';
+  body.innerHTML = renderMarkdown(turn.content);
+  if (turn.pending && !turn.content) {
+    body.innerHTML = '<p class="caret"></p>';
+  } else if (turn.pending) {
+    body.classList.add('caret');
+  }
+  decorateCodeBlocks(body);
+  article.appendChild(body);
+
+  return article;
+}
+
+function renderMessages() {
+  els.messagesInner.innerHTML = '';
+  if (state.turns.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = 'メッセージを入力して会話を開始します。';
+    els.messagesInner.appendChild(empty);
+    return;
+  }
+  state.turns.forEach((turn, index) => {
+    els.messagesInner.appendChild(buildMessageNode(turn, index));
+  });
+}
+
+let renderQueued = false;
+function scheduleStreamRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    const index = state.turns.length - 1;
+    const node = els.messagesInner.querySelector(`[data-index="${index}"]`);
+    const turn = state.turns[index];
+    if (!node || !turn) return;
+    const fresh = buildMessageNode(turn, index);
+    const openThinking = node.querySelector('details.thinking')?.open;
+    if (openThinking) {
+      const details = fresh.querySelector('details.thinking');
+      if (details) details.open = true;
+    }
+    node.replaceWith(fresh);
+    autoScroll();
+  });
+}
+
+function isNearBottom() {
+  const el = els.messages;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+}
+
+let stickToBottom = true;
+els.messages.addEventListener('scroll', () => {
+  stickToBottom = isNearBottom();
+});
+
+function autoScroll() {
+  if (stickToBottom) els.messages.scrollTop = els.messages.scrollHeight;
+}
+
+/* ---------- 送信 ---------- */
+
+function setStreaming(active) {
+  state.streaming = active;
+  els.send.hidden = active;
+  els.stop.hidden = !active;
+  els.input.disabled = false;
+}
+
+function autoResize() {
+  els.input.style.height = 'auto';
+  els.input.style.height = `${Math.min(els.input.scrollHeight, window.innerHeight * 0.4)}px`;
+}
+
+els.input.addEventListener('input', autoResize);
+
+els.input.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') return;
+  if (isTouch || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  els.composer.requestSubmit();
+});
+
+els.composer.addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (state.streaming) return;
+  const text = els.input.value.trim();
+  if (!text) return;
+  els.input.value = '';
+  autoResize();
+  sendMessage(text);
+});
+
+els.stop.addEventListener('click', () => {
+  state.controller?.abort();
+});
+
+els.newChat.addEventListener('click', () => {
+  state.controller?.abort();
+  state.turns = [];
+  clearError();
+  renderMessages();
+  els.input.focus();
+});
+
+els.copyInput.addEventListener('click', () => copyText(els.input.value, els.copyInput));
+els.errorDismiss.addEventListener('click', clearError);
+
+async function sendMessage(text) {
+  clearError();
+  stickToBottom = true;
+
+  const history = state.turns
+    .filter((turn) => turn.content.trim() !== '')
+    .map((turn) => ({ role: turn.role, content: turn.content }));
+  history.push({ role: 'user', content: text });
+
+  state.turns.push({ role: 'user', content: text });
+  const assistant = { role: 'assistant', content: '', thinking: '', pending: true };
+  state.turns.push(assistant);
+  renderMessages();
+  autoScroll();
+
+  const controller = new AbortController();
+  state.controller = controller;
+  setStreaming(true);
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: els.modelSelect.value,
+        effort: els.effortControl.hidden ? 'off' : els.effortSelect.value,
+        messages: history,
+      }),
+    });
+
+    if (res.status === 401) {
+      enterLogin();
+      throw new Error('セッションの有効期限が切れました。もう一度ログインしてください。');
+    }
+
+    if (!res.ok || !res.body) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || '応答の取得に失敗しました。');
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sep = buffer.indexOf('\n\n');
+      while (sep !== -1) {
+        const chunk = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        sep = buffer.indexOf('\n\n');
+
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          let payload;
+          try {
+            payload = JSON.parse(line.slice(5).trim());
+          } catch {
+            continue;
+          }
+          if (payload.type === 'text') {
+            assistant.content += payload.text;
+            scheduleStreamRender();
+          } else if (payload.type === 'thinking') {
+            assistant.thinking += payload.text;
+            scheduleStreamRender();
+          } else if (payload.type === 'error') {
+            showError(payload.message || '応答の生成中にエラーが発生しました。');
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      if (!assistant.content) assistant.content = '_（生成を停止しました）_';
+    } else {
+      showError(err.message || '通信エラーが発生しました。');
+      if (!assistant.content) {
+        state.turns = state.turns.filter((turn) => turn !== assistant);
+      }
+    }
+  } finally {
+    assistant.pending = false;
+    state.controller = null;
+    setStreaming(false);
+    renderMessages();
+    autoScroll();
+    els.input.focus();
+  }
+}
+
+/* ---------- 起動 ---------- */
+
+(async function init() {
+  if (await checkSession()) {
+    try {
+      await loadConfig();
+      enterApp();
+      return;
+    } catch {
+      /* 設定取得に失敗した場合はログインへ */
+    }
+  }
+  enterLogin();
+})();
+```
+
+```typescript
+// File: test/auth.test.ts
+import { describe, expect, it } from 'vitest';
+import {
+  buildSessionCookie,
+  clearSessionCookie,
+  createSessionToken,
+  parseCookies,
+  timingSafeEqual,
+  verifySessionToken,
+} from '../src/auth';
+
+const SECRET = 'test-secret-value-abcdefghijklmnop';
+
+describe('timingSafeEqual', () => {
+  it('一致する文字列で true を返す', () => {
+    expect(timingSafeEqual('1359', '1359')).toBe(true);
+  });
+
+  it('不一致や長さ違いで false を返す', () => {
+    expect(timingSafeEqual('1359', '1358')).toBe(false);
+    expect(timingSafeEqual('1359', '13599')).toBe(false);
+  });
+});
+
+describe('session token', () => {
+  it('生成したトークンを検証できる', async () => {
+    const token = await createSessionToken(SECRET);
+    expect(await verifySessionToken(token, SECRET)).toBe(true);
+  });
+
+  it('別のシークレットでは検証に失敗する', async () => {
+    const token = await createSessionToken(SECRET);
+    expect(await verifySessionToken(token, 'another-secret')).toBe(false);
+  });
+
+  it('改ざんされたトークンを拒否する', async () => {
+    const token = await createSessionToken(SECRET);
+    const [payload, signature] = token.split('.');
+    expect(await verifySessionToken(`${payload}x.${signature}`, SECRET)).toBe(false);
+  });
+
+  it('期限切れトークンを拒否する', async () => {
+    const token = await createSessionToken(SECRET, Date.now(), 1);
+    expect(await verifySessionToken(token, SECRET, Date.now() + 5000)).toBe(false);
+  });
+
+  it('不正な形式を拒否する', async () => {
+    expect(await verifySessionToken('', SECRET)).toBe(false);
+    expect(await verifySessionToken('abc', SECRET)).toBe(false);
+  });
+});
+
+describe('cookies', () => {
+  it('Cookie ヘッダをパースする', () => {
+    expect(parseCookies('a=1; cc_session=abc.def')).toEqual({ a: '1', cc_session: 'abc.def' });
+    expect(parseCookies(null)).toEqual({});
+  });
+
+  it('HttpOnly / SameSite を必ず付与する', () => {
+    const cookie = buildSessionCookie('t', true);
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).toContain('Secure');
+    expect(buildSessionCookie('t', false)).not.toContain('Secure');
+    expect(clearSessionCookie(false)).toContain('Max-Age=0');
+  });
+});
+```
+
+```typescript
+// File: test/models.test.ts
+import { describe, expect, it } from 'vitest';
+import { BASE_MAX_OUTPUT_TOKENS, MODELS, buildRequestBody, findEffort, findModel } from '../src/models';
+
+describe('model allowlist', () => {
+  it('定義済みモデルのみ解決する', () => {
+    expect(findModel('claude-haiku-4-5')?.label).toBe('Haiku 4.5');
+    expect(findModel('gpt-4o')).toBeUndefined();
+    expect(findModel(undefined)).toBeUndefined();
+  });
+
+  it('モデル ID は空でなく重複しない', () => {
+    const ids = MODELS.map((m) => m.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.every((id) => id.startsWith('claude-'))).toBe(true);
+  });
+});
+
+describe('buildRequestBody', () => {
+  const messages = [{ role: 'user' as const, content: 'こんにちは' }];
+
+  it('effort=off では thinking を付けない', () => {
+    const body = buildRequestBody({
+      model: findModel('claude-sonnet-4-5')!,
+      effort: findEffort('off')!,
+      messages,
+    });
+    expect(body.thinking).toBeUndefined();
+    expect(body.max_tokens).toBe(BASE_MAX_OUTPUT_TOKENS);
+    expect(body.stream).toBe(true);
+    expect(body.temperature).toBe(1);
+  });
+
+  it('effort 指定時は thinking を有効化し max_tokens > budget_tokens を満たす', () => {
+    const effort = findEffort('high')!;
+    const body = buildRequestBody({
+      model: findModel('claude-opus-4-5')!,
+      effort,
+      messages,
+    });
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: effort.budgetTokens });
+    expect(body.max_tokens).toBeGreaterThan(effort.budgetTokens);
+    // thinking 有効時は temperature を送らない
+    expect(body.temperature).toBeUndefined();
+  });
+
+  it('max_tokens はモデル上限を超えない', () => {
+    const model = { ...findModel('claude-haiku-4-5')!, maxOutputTokens: 3000 };
+    const body = buildRequestBody({ model, effort: findEffort('high')!, messages });
+    expect(body.max_tokens).toBe(3000);
+  });
+});
+```
+
+```typescript
+// File: test/markdown.test.ts
+import { describe, expect, it } from 'vitest';
+// @ts-expect-error - プレーン JS モジュール
+import { renderInline, renderMarkdown } from '../public/markdown.js';
+
+describe('renderMarkdown', () => {
+  it('HTML をエスケープする', () => {
+    const html = renderMarkdown('<script>alert(1)</script>');
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('コードブロックを言語クラス付きで描画する', () => {
+    const html = renderMarkdown('```js\nconst a = 1 < 2;\n```');
+    expect(html).toContain('<pre data-lang="js"><code class="language-js">');
+    expect(html).toContain('const a = 1 &lt; 2;');
+  });
+
+  it('見出し・箇条書き・番号付きリストを描画する', () => {
+    expect(renderMarkdown('## 見出し')).toBe('<h2>見出し</h2>');
+    expect(renderMarkdown('- a\n- b')).toBe('<ul><li>a</li><li>b</li></ul>');
+    expect(renderMarkdown('1. a\n2. b')).toBe('<ol><li>a</li><li>b</li></ol>');
+  });
+
+  it('ネストしたリストを描画する', () => {
+    const html = renderMarkdown('- 親\n  - 子');
+    expect(html).toContain('<ul><li>親');
+    expect(html).toContain('<ul><li>子</li></ul>');
+  });
+
+  it('強調・インラインコードを描画する', () => {
+    const html = renderMarkdown('**太字** と `code`');
+    expect(html).toContain('<strong>太字</strong>');
+    expect(html).toContain('<code>code</code>');
+  });
+
+  it('インラインコード内の Markdown を解釈しない', () => {
+    expect(renderMarkdown('`**not bold**`')).toContain('<code>**not bold**</code>');
+  });
+
+  it('安全なリンクのみ href を生成する', () => {
+    expect(renderMarkdown('[x](https://example.com)')).toContain('href="https://example.com"');
+    const unsafe = renderMarkdown('[x](javascript:alert(1))');
+    expect(unsafe).not.toContain('href=');
+  });
+
+  it('テーブルを描画する', () => {
+    const html = renderMarkdown('| a | b |\n| --- | ---: |\n| 1 | 2 |');
+    expect(html).toContain('<table>');
+    expect(html).toContain('<th>a</th>');
+    expect(html).toContain('style="text-align:right"');
+  });
+
+  it('引用と水平線を描画する', () => {
+    expect(renderMarkdown('> quote')).toContain('<blockquote>');
+    expect(renderMarkdown('---')).toBe('<hr>');
+  });
+
+  it('段落内の改行を <br> にする', () => {
+    expect(renderMarkdown('a\nb')).toBe('<p>a<br>b</p>');
+  });
+});
+
+describe('renderInline', () => {
+  it('引用符もエスケープする', () => {
+    expect(renderInline('"x"')).toBe('&quot;x&quot;');
+  });
+});
+```
+
+```typescript
+// File: test/worker.test.ts
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import worker, { type Env, validateChatPayload } from '../src/index';
+import { SESSION_COOKIE, createSessionToken } from '../src/auth';
+
+const SECRET = 'unit-test-secret-0123456789';
+
+function makeEnv(overrides: Partial<Env> = {}): Env {
+  return {
+    ANTHROPIC_API_KEY: 'sk-ant-test',
+    ACCESS_CODE: '1359',
+    SESSION_SECRET: SECRET,
+    ASSETS: { fetch: async () => new Response('static', { status: 200 }) },
+    ...overrides,
+  };
+}
+
+function sseResponse(events: string[]): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of events) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
+async function readAll(res: Response): Promise<string> {
+  return await res.text();
+}
+
+let authCookie = '';
+
+beforeEach(async () => {
+  authCookie = `${SESSION_COOKIE}=${await createSessionToken(SECRET)}`;
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe('validateChatPayload', () => {
+  it('未知のモデルを拒否する', () => {
+    const result = validateChatPayload({ model: 'evil', messages: [{ role: 'user', content: 'a' }] });
+    expect(result.ok).toBe(false);
+  });
+
+  it('空のメッセージ配列を拒否する', () => {
+    expect(validateChatPayload({ model: 'claude-haiku-4-5', messages: [] }).ok).toBe(false);
+  });
+
+  it('不正な role を拒否する', () => {
+    const result = validateChatPayload({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'system', content: 'a' }],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it('正しいペイロードを受理する', () => {
+    const result = validateChatPayload({
+      model: 'claude-haiku-4-5',
+      effort: 'low',
+      messages: [{ role: 'user', content: 'こんにちは' }],
+    });
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('/api/login', () => {
+  it('誤ったコードを 401 で拒否する', async () => {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ code: '0000' }),
+      }),
+      makeEnv(),
+    );
+    expect(res.status).toBe(401);
+    expect(res.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('正しいコードで HttpOnly Cookie を発行する', async () => {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ code: '1359' }),
+      }),
+      makeEnv(),
+    );
+    expect(res.status).toBe(200);
+    const cookie = res.headers.get('set-cookie') ?? '';
+    expect(cookie).toContain(SESSION_COOKIE);
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Secure');
+  });
+});
+
+describe('認証ガード', () => {
+  it('Cookie なしの /api/chat を 401 にする', async () => {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/chat', { method: 'POST', body: '{}' }),
+      makeEnv(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('Cookie なしの /api/models を 401 にする', async () => {
+    const res = await worker.fetch(new Request('https://example.com/api/models'), makeEnv());
+    expect(res.status).toBe(401);
+  });
+
+  it('認証済みならモデル一覧を返す', async () => {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/models', { headers: { cookie: authCookie } }),
+      makeEnv(),
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { models: unknown[]; efforts: unknown[] };
+    expect(data.models.length).toBe(3);
+    expect(data.efforts.length).toBeGreaterThan(0);
+    expect(JSON.stringify(data)).not.toContain('sk-ant');
+  });
+});
+
+describe('/api/chat', () => {
+  it('Anthropic のストリームをクライアント向けイベントへ変換する', async () => {
+    const fetchMock = vi.fn(async () =>
+      sseResponse([
+        'event: message_start\ndata: {"type":"message_start"}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"こん"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"にちは"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ]),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await worker.fetch(
+      new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { cookie: authCookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5',
+          effort: 'off',
+          messages: [{ role: 'user', content: 'やあ' }],
+        }),
+      }),
+      makeEnv(),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const body = await readAll(res);
+    expect(body).toContain('"type":"text","text":"こん"');
+    expect(body).toContain('"type":"text","text":"にちは"');
+    expect(body).toContain('"type":"done"');
+
+    // API キーがヘッダにのみ載り、レスポンスに漏れないこと
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['x-api-key']).toBe('sk-ant-test');
+    expect(body).not.toContain('sk-ant-test');
+  });
+
+  it('上流エラー時に内部情報を返さない', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: { message: 'invalid x-api-key sk-ant-test' } }), {
+          status: 401,
+        }),
+      ),
+    );
+
+    const res = await worker.fetch(
+      new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { cookie: authCookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5',
+          messages: [{ role: 'user', content: 'やあ' }],
+        }),
+      }),
+      makeEnv(),
+    );
+
+    expect(res.status).toBe(502);
+    const text = await res.text();
+    expect(text).not.toContain('sk-ant');
+    expect(text).not.toContain('x-api-key');
+    expect(text).toContain('サーバー側の設定に問題があります');
+  });
+
+  it('API キー未設定時は汎用エラーを返す', async () => {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { cookie: authCookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5',
+          messages: [{ role: 'user', content: 'やあ' }],
+        }),
+      }),
+      makeEnv({ ANTHROPIC_API_KEY: undefined }),
+    );
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain('サーバーの設定が完了していません');
+  });
+});
+
+describe('静的アセット', () => {
+  it('API 以外のパスは ASSETS へ委譲する', async () => {
+    const res = await worker.fetch(new Request('https://example.com/'), makeEnv());
+    expect(await res.text()).toBe('static');
+  });
+});
+```
+
+```markdown
+<!-- File: README.md -->
+# Claude Chat (Cloudflare Workers)
+
+Claude API を利用する最小構成のチャット Web アプリ。API キーは Cloudflare Workers 側の
+シークレットとしてのみ保持し、ブラウザには一切渡さない。
+
+## 機能
+
+- 簡易アクセスコード認証（HttpOnly + 署名付き Cookie セッション）
+- モデル選択（Haiku / Sonnet / Opus）
+- 推論量（effort）選択 = Extended Thinking の `budget_tokens`
+- SSE によるストリーミング表示
+- 入力・出力とも Markdown 対応（コードブロック、リスト、表、引用など）
+- 各回答・各コードブロック・入力欄のワンクリックコピー
+- ライト/ダーク対応、モバイル・デスクトップ両対応のレイアウト
+
+## 構成
+
+```
+src/index.ts       Worker 本体（ルーティング、認証、SSE 中継）
+src/auth.ts        HMAC 署名セッション
+src/models.ts      モデル定義・リクエストボディ組み立て
+src/anthropic.ts   Anthropic Messages API 呼び出し・SSE パース
+public/            静的アセット（HTML / CSS / JS / Markdown レンダラ）
+test/              Vitest によるユニットテスト
+```
+
+サーバー側ルート:
+
+| メソッド | パス | 説明 |
+| --- | --- | --- |
+| POST | `/api/login` | アクセスコード検証、セッション Cookie 発行 |
+| POST | `/api/logout` | セッション破棄 |
+| GET | `/api/session` | ログイン状態の確認 |
+| GET | `/api/models` | 利用可能モデル / effort 一覧（要認証） |
+| POST | `/api/chat` | Claude へのストリーミング中継（要認証） |
+
+## 環境変数
+
+| 名称 | 種別 | 説明 |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | Secret | Anthropic Console で発行した API キー |
+| `SESSION_SECRET` | Secret | セッション署名鍵（32 文字以上のランダム文字列） |
+| `ACCESS_CODE` | Var | ログイン用アクセスコード（既定値 `1359`） |
+
+`ANTHROPIC_API_KEY` と `SESSION_SECRET` は必ず Secret として登録する。`wrangler.toml` に書かない。
+
+## ローカルでの起動
+
+1. 依存関係のインストール
+
+   ```
+   npm install
+   ```
+
+2. ローカル用の環境変数ファイルを作成
+
+   ```
+   cp .dev.vars.example .dev.vars
+   ```
+
+   `.dev.vars` を編集し、`ANTHROPIC_API_KEY` と `SESSION_SECRET` を設定する。
+   `SESSION_SECRET` は次のコマンドで生成できる。
+
+   ```
+   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+   ```
+
+3. 開発サーバーの起動
+
+   ```
+   npm run dev
+   ```
+
+4. 表示された `http://localhost:8787` を開き、アクセスコード `1359` を入力する。
+
+## テスト
+
+```
+npm test
+npm run typecheck
+```
+
+テスト内容:
+
+- セッショントークンの生成・検証・改ざん検出・期限切れ
+- モデル許可リストとリクエストボディ（`thinking` / `max_tokens` の整合）
+- Markdown レンダラのエスケープ・各記法・危険な URL スキームの遮断
+- Worker のルーティング、認証ガード、SSE 変換、エラー時の情報漏えい防止
+
+## Cloudflare へのデプロイ
+
+1. Wrangler でログイン
+
+   ```
+   npx wrangler login
+   ```
+
+2. シークレットを登録
+
+   ```
+   npx wrangler secret put ANTHROPIC_API_KEY
+   npx wrangler secret put SESSION_SECRET
+   ```
+
+3. 必要ならアクセスコードを変更（`wrangler.toml` の `[vars] ACCESS_CODE`、
+   または `npx wrangler secret put ACCESS_CODE` で上書き）
+
+4. デプロイ
+
+   ```
+   npm run deploy
+   ```
+
+5. 出力された `https://claude-chat.<subdomain>.workers.dev` を開いて動作確認する。
+
+独自ドメインを使う場合は Cloudflare ダッシュボードの Workers → 対象 Worker →
+Settings → Domains & Routes からカスタムドメインを追加する。
+
+デプロイ後にシークレットを更新した場合は再デプロイ不要で即時反映される。
+
+## モデル ID と effort の根拠
+
+参照する一次情報は Anthropic 公式ドキュメントのみ。
+
+- Models overview: `docs.anthropic.com/en/docs/about-claude/models/overview`
+- Messages API: `docs.anthropic.com/en/api/messages`
+- Extended thinking: `docs.anthropic.com/en/docs/build-with-claude/extended-thinking`
+- Streaming Messages: `docs.anthropic.com/en/docs/build-with-claude/streaming`
+
+注意点:
+
+- 「Sonnet 5 / Opus 5」という名称のモデルは公式の Models overview に存在しないため、
+  実在する最新世代（Claude 4.5 系）の ID に置き換えている。存在しないモデル名は送信しない。
+- 新しい世代が公開された場合は `src/models.ts` の `MODELS` にある `id` を、
+  公式 Models overview に記載された Model ID へ更新するだけでよい。
+  UI・API・テストは自動的に追従する（テストは ID の重複と接頭辞のみ検証する）。
+- 「推論量（effort）」は、公式に仕様が公開されている Extended Thinking の
+  `thinking.budget_tokens` へマッピングしている。仕様が確認できない非公開パラメータは送信しない。
+  将来 `effort` パラメータが公式ドキュメントに追加された場合は、
+  `src/models.ts` の `buildRequestBody()` のみを差し替えれば対応できる。
+- Extended Thinking 有効時は `max_tokens > budget_tokens` を満たし、`temperature` を送らない
+  （公式仕様に準拠）。
+
+## セキュリティ上の設計と制限
+
+- API キーは Worker のシークレットにのみ存在し、レスポンスにもクライアントコードにも含まれない。
+- 上流エラーは `console.error` にのみ記録し、画面には汎用の日本語メッセージだけを表示する。
+- セッションは HMAC-SHA256 署名付きトークンを HttpOnly / SameSite=Lax Cookie に格納する
+  （有効期限 12 時間）。
+- Markdown はサニタイズ済みの自前レンダラで描画する（生 HTML は出力しない）。
+- アクセスコード認証はあくまで簡易的なアクセス制限であり、本格的な認証基盤ではない。
+  失敗時に短い遅延を入れているが、厳密なレート制限は行っていない。
+  より強い保護が必要な場合は Cloudflare Access 等を前段に置くこと。
+- 会話履歴はブラウザのメモリ上のみに保持し、サーバーには保存しない
+  （リロードで消える。モデルと effort の選択のみ `localStorage` に保存）。
+```
+
+実装上の確認点:
+
+- モデル ID は `claude-haiku-4-5` / `claude-sonnet-4-5` / `claude-opus-4-5` を使用。公式 Models overview に存在しない「Sonnet 5 / Opus 5」は送信せず、UI ラベルも実在の世代表記に合わせた。
+- 「effort」は公式仕様が確定している Extended Thinking の `budget_tokens` にマッピングし、非公開パラメータの推測送信は行っていない。差し替え箇所は `src/models.ts` の `buildRequestBody()` に限定してある。
+- デプロイ前に必須の作業は `wrangler secret put ANTHROPIC_API_KEY` と `wrangler secret put SESSION_SECRET` の 2 点のみ。

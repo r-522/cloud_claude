@@ -1,0 +1,16 @@
+# File: wrangler.toml
+name = "claude-chat"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# 静的アセット（ログイン画面 / チャットUI）
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# 秘密情報は必ず `wrangler secret put` で登録する。
+# ここには何も書かない（コミットされるため）。
+#   CLAUDE_API_KEY  … Anthropic APIキー（必須）
+#   SESSION_SECRET  … セッションCookie署名用のランダム文字列（必須）
+#   ACCESS_CODE     … アクセスコード（任意。未設定時は "1359"）

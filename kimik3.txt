@@ -1,0 +1,1608 @@
+## 実装判断（Claude API 仕様の一次情報に基づく部分）
+
+- モデルID: Anthropic公式ドキュメント「Models overview」時点で `Sonnet 5` / `Opus 5` は提供されていないため、要件の指示どおり「利用可能なもの」に置き換え
+  - Claude Haiku 4.5 → `claude-haiku-4-5-20251001`
+  - Claude Sonnet 4.5 → `claude-sonnet-4-5-20250929`
+  - Claude Opus 4.5 → `claude-opus-4-5-20251101`
+  - 新モデル公開時は `src/config.js` の1箇所だけ更新すればよい構造
+- effort: 公式ドキュメント「Effort」に基づき、Opus 4.5 のみ対応（`output_config.effort` + betaヘッダ `effort-2025-11-24`、値は `low` / `medium` / `high`）
+  - 非対応モデルではUI側で無効化し、サーバー側でもパラメータを送信しない二重ガード
+- ストリーミング: Messages API の `stream: true`（SSE）をWorkerで中継し、ブラウザで逐次レンダリング
+- 認証: HMAC-SHA256署名付きHttpOnly Cookie（7日間有効）。アクセスコードは環境変数 `ACCESS_CODE`、未設定時のみ `1359` にフォールバック
+- APIキー: Cloudflareのシークレット `CLAUDE_API_KEY` のみ。クライアントコード・レスポンス・エラー文に一切含めない
+
+## ファイル構成
+
+```text
+claude-chat/
+├── wrangler.toml
+├── package.json
+├── .gitignore
+├── .dev.vars.example
+├── README.md
+├── src/
+│   ├── worker.js
+│   ├── auth.js
+│   ├── config.js
+│   └── validate.js
+├── public/
+│   ├── index.html
+│   ├── styles.css
+│   ├── app.js
+│   └── _headers
+└── test/
+    ├── auth.test.js
+    └── validate.test.js
+```
+
+## コード / 設定
+
+```toml
+# File: wrangler.toml
+name = "claude-chat"
+main = "src/worker.js"
+compatibility_date = "2025-12-01"
+
+# 静的アセット（public/）をWorkers Static Assetsとして配信
+# /api/* 以外のリクエストは静的ファイルが自動配信される
+[assets]
+directory = "./public"
+
+# シークレットはコミットしない。以下は `wrangler secret put` で設定する:
+#   CLAUDE_API_KEY  … Anthropic APIキー（必須）
+#   AUTH_SECRET     … セッション署名用のランダム文字列（推奨。未設定時は CLAUDE_API_KEY で代用）
+#   ACCESS_CODE     … アクセスコード（任意。未設定時は "1359"）
+```
+
+```json
+{
+  "name": "claude-chat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
+```
+
+```text
+# File: .gitignore
+node_modules/
+.dev.vars
+.wrangler/
+```
+
+```bash
+# File: .dev.vars.example
+# ローカル開発用。このファイルを .dev.vars としてコピーして値を入れる（.dev.vars はコミット禁止）
+CLAUDE_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx
+ACCESS_CODE=1359
+AUTH_SECRET=change-me-to-a-long-random-string
+```
+
+```js
+// File: src/config.js
+// モデルIDは Anthropic 公式ドキュメント（Models overview）の一次情報に基づく。
+// 新しいモデルが公開されたら、この配列だけを更新すること。
+
+export const MODELS = [
+  {
+    id: "claude-haiku-4-5-20251001",
+    label: "Claude Haiku 4.5",
+    supportsEffort: false,
+  },
+  {
+    id: "claude-sonnet-4-5-20250929",
+    label: "Claude Sonnet 4.5",
+    supportsEffort: false,
+  },
+  {
+    id: "claude-opus-4-5-20251101",
+    label: "Claude Opus 4.5",
+    supportsEffort: true,
+  },
+];
+
+// effort（推論量）: 公式ドキュメント「Effort」に基づく。
+// Opus 4.5 でのみ有効。beta ヘッダーが必要。
+export const EFFORT_LEVELS = ["low", "medium", "high"];
+export const EFFORT_BETA_HEADER = "effort-2025-11-24";
+
+export const DEFAULT_MAX_TOKENS = 8192;
+export const MAX_HISTORY = 20;
+export const MAX_MESSAGE_CHARS = 8000;
+export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7日
+```
+
+```js
+// File: src/auth.js
+import { SESSION_TTL_SECONDS } from "./config.js";
+
+const encoder = new TextEncoder();
+
+// 長さが異なる場合は即 false（簡易アクセス制限用途のため許容）
+export function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length === 0 || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
+  return Array.from(new Uint8Array(signature), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// セッション署名の秘密鍵。AUTH_SECRET 優先、未設定なら API キーから派生させる
+export function resolveAuthSecret(env) {
+  return env.AUTH_SECRET || env.CLAUDE_API_KEY || "";
+}
+
+export async function createSessionCookie(secret, ttlSeconds = SESSION_TTL_SECONDS) {
+  const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const signature = await hmacHex(secret, String(expires));
+  const maxAge = Math.max(ttlSeconds, 0);
+  return `session=${expires}.${signature}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+}
+
+export function clearSessionCookie() {
+  return "session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
+}
+
+function readCookie(request, name) {
+  const header = request.headers.get("Cookie") || "";
+  for (const part of header.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return rest.join("=");
+  }
+  return "";
+}
+
+export async function verifyRequest(request, secret) {
+  if (!secret) return false;
+  const token = readCookie(request, "session");
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const expiresStr = token.slice(0, dot);
+  const signature = token.slice(dot + 1);
+  const expires = Number(expiresStr);
+  if (!Number.isInteger(expires) || expires < Math.floor(Date.now() / 1000)) return false;
+  const expected = await hmacHex(secret, expiresStr);
+  return timingSafeEqual(expected, signature);
+}
+```
+
+```js
+// File: src/validate.js
+import { MODELS, EFFORT_LEVELS, MAX_HISTORY, MAX_MESSAGE_CHARS } from "./config.js";
+
+// クライアント入力を検証し、APIに渡せる形へ正規化する
+export function validateChatBody(body) {
+  if (!body || typeof body !== "object") {
+    return { ok: false, error: "リクエスト形式が不正です。" };
+  }
+
+  const model = MODELS.find((m) => m.id === body.model);
+  if (!model) {
+    return { ok: false, error: "選択されたモデルは利用できません。" };
+  }
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return { ok: false, error: "メッセージが空です。" };
+  }
+
+  const sliced = body.messages.slice(-MAX_HISTORY);
+  const messages = [];
+  for (const msg of sliced) {
+    if (!msg || (msg.role !== "user" && msg.role !== "assistant")) {
+      return { ok: false, error: "メッセージ形式が不正です。" };
+    }
+    if (
+      typeof msg.content !== "string" ||
+      msg.content.trim() === "" ||
+      msg.content.length > MAX_MESSAGE_CHARS
+    ) {
+      return { ok: false, error: "メッセージが空、または長すぎます（8000文字以内）。" };
+    }
+    // API の role 交互制約に合わせ、連続する同一 role は結合する
+    const last = messages[messages.length - 1];
+    if (last && last.role === msg.role) {
+      last.content += "\n\n" + msg.content;
+    } else {
+      messages.push({ role: msg.role, content: msg.content });
+    }
+  }
+
+  // 履歴スライスで先頭が assistant になった場合に備え、user 始まりに揃える
+  while (messages.length > 0 && messages[0].role !== "user") messages.shift();
+  if (messages.length === 0) {
+    return { ok: false, error: "メッセージが空です。" };
+  }
+
+  // effort は対応モデルかつ有効な値のときだけ採用（それ以外は送らない）
+  let effort = null;
+  if (model.supportsEffort && typeof body.effort === "string" && EFFORT_LEVELS.includes(body.effort)) {
+    effort = body.effort;
+  }
+
+  return { ok: true, value: { model, messages, effort } };
+}
+```
+
+```js
+// File: src/worker.js
+import { MODELS, DEFAULT_MAX_TOKENS, EFFORT_BETA_HEADER } from "./config.js";
+import {
+  createSessionCookie,
+  clearSessionCookie,
+  verifyRequest,
+  resolveAuthSecret,
+  timingSafeEqual,
+} from "./auth.js";
+import { validateChatBody } from "./validate.js";
+
+const API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION = "2023-06-01";
+
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      ...extraHeaders,
+    },
+  });
+}
+
+// 上流のエラー内容（APIキー等の内部情報を含みうる）は画面に返さず、状況別の定型文に変換する
+function upstreamErrorMessage(status) {
+  if (status === 401 || status === 403) {
+    return "サーバー側の認証設定に問題があります。管理者に連絡してください。";
+  }
+  if (status === 400) {
+    return "リクエストが拒否されました。入力を短くするか、モデルを変更してください。";
+  }
+  if (status === 404) {
+    return "指定されたモデルが見つかりません。管理者に連絡してください。";
+  }
+  if (status === 429) {
+    return "利用制限に達しました。しばらく待ってから再試行してください。";
+  }
+  if (status === 529 || status === 503) {
+    return "Claude API が混雑しています。時間をおいて再試行してください。";
+  }
+  return "Claude API で一時的なエラーが発生しました。時間をおいて再試行してください。";
+}
+
+async function requireAuth(request, env) {
+  return verifyRequest(request, resolveAuthSecret(env));
+}
+
+async function handleLogin(request, env) {
+  let body = null;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "リクエスト形式が不正です。" }, 400);
+  }
+
+  const secret = resolveAuthSecret(env);
+  if (!secret) {
+    return json({ error: "サーバー設定エラーです。管理者に連絡してください。" }, 500);
+  }
+
+  const expected = env.ACCESS_CODE || "1359";
+  const code = typeof body?.code === "string" ? body.code : "";
+  if (!timingSafeEqual(code, expected)) {
+    // 総当たり緩和のため失敗時は少し待つ
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return json({ error: "アクセスコードが違います。" }, 401);
+  }
+
+  return json({ ok: true }, 200, { "Set-Cookie": await createSessionCookie(secret) });
+}
+
+async function handleChat(request, env) {
+  if (!env.CLAUDE_API_KEY) {
+    return json({ error: "サーバー設定エラーです。管理者に連絡してください。" }, 500);
+  }
+
+  let body = null;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "リクエスト形式が不正です。" }, 400);
+  }
+
+  const check = validateChatBody(body);
+  if (!check.ok) {
+    return json({ error: check.error }, 400);
+  }
+  const { model, messages, effort } = check.value;
+
+  const payload = {
+    model: model.id,
+    max_tokens: DEFAULT_MAX_TOKENS,
+    stream: true,
+    messages,
+  };
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": env.CLAUDE_API_KEY,
+    "anthropic-version": ANTHROPIC_VERSION,
+  };
+  if (effort) {
+    payload.output_config = { effort };
+    headers["anthropic-beta"] = EFFORT_BETA_HEADER;
+  }
+
+  let upstream;
+  try {
+    upstream = await fetch(API_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error("upstream fetch failed", err);
+    return json({ error: "Claude API に接続できませんでした。時間をおいて再試行してください。" }, 502);
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    const status = upstream.status;
+    // 詳細はサーバーログにのみ残し、クライアントには返さない
+    console.error("anthropic api error", status, await upstream.text().catch(() => ""));
+    return json({ error: upstreamErrorMessage(status) }, status === 429 ? 429 : 502);
+  }
+
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    const { pathname } = new URL(request.url);
+
+    if (pathname === "/api/login" && request.method === "POST") {
+      return handleLogin(request, env);
+    }
+    if (pathname === "/api/logout" && request.method === "POST") {
+      return json({ ok: true }, 200, { "Set-Cookie": clearSessionCookie() });
+    }
+    if (pathname === "/api/session" && request.method === "GET") {
+      return (await requireAuth(request, env))
+        ? json({ ok: true })
+        : json({ error: "unauthorized" }, 401);
+    }
+    if (pathname === "/api/models" && request.method === "GET") {
+      if (!(await requireAuth(request, env))) {
+        return json({ error: "ログインが必要です。" }, 401);
+      }
+      return json({
+        models: MODELS.map(({ id, label, supportsEffort }) => ({ id, label, supportsEffort })),
+      });
+    }
+    if (pathname === "/api/chat" && request.method === "POST") {
+      if (!(await requireAuth(request, env))) {
+        return json({ error: "ログインが必要です。" }, 401);
+      }
+      return handleChat(request, env);
+    }
+    if (pathname.startsWith("/api/")) {
+      return json({ error: "Not Found" }, 404);
+    }
+    // 静的アセットに一致しないパス
+    return new Response("Not Found", { status: 404 });
+  },
+};
+```
+
+```html
+<!-- File: public/index.html -->
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Claude Chat</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+
+  <main id="login-view" class="login-view" hidden>
+    <form id="login-form" class="login-card" autocomplete="off">
+      <h1 class="login-title">Claude Chat</h1>
+      <p class="login-description">このページは関係者専用です。アクセスコードを入力してください。</p>
+      <label class="field-label" for="login-code">アクセスコード</label>
+      <input id="login-code" name="code" type="password" class="text-input" placeholder="アクセスコード" required>
+      <p class="login-hint">※ アクセスコードは「アルファベット大文字小文字記号を含む」必要があります。</p>
+      <p id="login-error" class="form-error" role="alert"></p>
+      <button id="login-button" type="submit" class="button button-primary button-block">ログイン</button>
+    </form>
+  </main>
+
+  <div id="chat-view" class="chat-view" hidden>
+    <header class="chat-header">
+      <div class="chat-header-inner">
+        <h1 class="app-title">Claude Chat</h1>
+        <div class="controls">
+          <label class="control">
+            <span class="control-label">モデル</span>
+            <select id="model-select" class="select"></select>
+          </label>
+          <label class="control" id="effort-field">
+            <span class="control-label">Effort</span>
+            <select id="effort-select" class="select">
+              <option value="high" selected>High（標準）</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </label>
+          <button id="logout-button" type="button" class="button button-ghost">ログアウト</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="chat-main">
+      <div id="messages" class="messages">
+        <p id="empty-state" class="empty-state">メッセージを入力すると会話が始まります。</p>
+      </div>
+    </main>
+
+    <footer class="composer-area">
+      <form id="composer" class="composer">
+        <textarea
+          id="input"
+          class="composer-input"
+          rows="1"
+          placeholder="メッセージを入力（Enter で送信 / Shift+Enter で改行）"></textarea>
+        <div class="composer-actions">
+          <button id="copy-input-button" type="button" class="button button-ghost">入力をコピー</button>
+          <button id="send-button" type="submit" class="button button-primary">送信</button>
+        </div>
+      </form>
+    </footer>
+  </div>
+
+</body>
+</html>
+```
+
+```css
+/* File: public/styles.css */
+:root {
+  --color-bg: #ffffff;
+  --color-bg-subtle: #f7f7f5;
+  --color-border: #e3e2df;
+  --color-text: #1c1c1a;
+  --color-text-muted: #6b6a66;
+  --color-danger: #b3261e;
+  --color-code-bg: #f4f4f1;
+  --color-focus: #4c7dd9;
+  --radius: 6px;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
+    "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  background: var(--color-bg);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ---------- ボタン / フォーム共通 ---------- */
+.button {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 16px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.button-primary {
+  background: var(--color-text);
+  color: #ffffff;
+  border-color: var(--color-text);
+}
+
+.button-primary:hover:not(:disabled) {
+  background: #35352f;
+}
+
+.button-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.button-ghost {
+  background: transparent;
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.button-ghost:hover {
+  background: var(--color-bg-subtle);
+}
+
+.button-block {
+  width: 100%;
+}
+
+.text-input,
+.select,
+.composer-input {
+  font: inherit;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: #ffffff;
+  color: var(--color-text);
+}
+
+.button:focus-visible,
+.select:focus-visible,
+.text-input:focus-visible,
+.composer-input:focus-visible,
+.copy-button:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+}
+
+/* ---------- ログイン ---------- */
+.login-view {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--color-bg-subtle);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 32px 28px;
+}
+
+.login-title {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.login-description {
+  margin: 0 0 20px;
+  color: var(--color-text-muted);
+  font-size: 14px;
+}
+
+.field-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.text-input {
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 15px;
+}
+
+.login-hint {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin: 8px 0 0;
+}
+
+.form-error {
+  color: var(--color-danger);
+  font-size: 13px;
+  min-height: 1.4em;
+  margin: 10px 0;
+}
+
+/* ---------- チャット全体 ---------- */
+.chat-view {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+.chat-header {
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg);
+}
+
+.chat-header-inner {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.app-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.control.is-disabled {
+  opacity: 0.55;
+}
+
+.select {
+  font-size: 13px;
+  padding: 6px 8px;
+}
+
+.select:disabled {
+  cursor: not-allowed;
+}
+
+/* ---------- メッセージ ---------- */
+.chat-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.messages {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 24px 16px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.empty-state {
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: 14px;
+  margin: 48px 0;
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.message-user .message-body {
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+
+.message-body {
+  font-size: 15px;
+  overflow-wrap: break-word;
+}
+
+.message-body > :first-child {
+  margin-top: 0;
+}
+
+.message-body > :last-child {
+  margin-bottom: 0;
+}
+
+.message-body pre {
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.message-body code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--color-code-bg);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.message-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.message-body ul,
+.message-body ol {
+  padding-left: 1.5em;
+}
+
+.message-body blockquote {
+  margin: 0;
+  padding-left: 14px;
+  border-left: 3px solid var(--color-border);
+  color: var(--color-text-muted);
+}
+
+.message-body table {
+  border-collapse: collapse;
+}
+
+.message-body th,
+.message-body td {
+  border: 1px solid var(--color-border);
+  padding: 6px 10px;
+  font-size: 14px;
+}
+
+.message-body a {
+  color: #2563eb;
+}
+
+.copy-button {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: #ffffff;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.copy-button:hover {
+  color: var(--color-text);
+  background: var(--color-bg-subtle);
+}
+
+.inline-error {
+  color: var(--color-danger);
+  font-size: 13px;
+  margin: 6px 0 0;
+}
+
+/* ---------- 入力エリア ---------- */
+.composer-area {
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg);
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+}
+
+.composer {
+  max-width: 820px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.composer-input {
+  width: 100%;
+  resize: none;
+  font-size: 15px;
+  line-height: 1.6;
+  padding: 10px 12px;
+  max-height: 200px;
+}
+
+.composer-input:focus {
+  outline: none;
+  border-color: #9a9a94;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.06);
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ---------- トースト ---------- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  background: #242420;
+  color: #ffffff;
+  font-size: 13px;
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  max-width: min(90vw, 480px);
+  z-index: 50;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+
+/* ---------- モバイル ---------- */
+@media (max-width: 640px) {
+  .chat-header-inner {
+    padding: 8px 12px;
+  }
+
+  .messages {
+    padding: 16px 12px 24px;
+  }
+
+  .control-label {
+    display: none;
+  }
+}
+```
+
+```js
+// File: public/app.js
+(() => {
+  "use strict";
+
+  const loginView = document.getElementById("login-view");
+  const chatView = document.getElementById("chat-view");
+  const loginForm = document.getElementById("login-form");
+  const loginCode = document.getElementById("login-code");
+  const loginError = document.getElementById("login-error");
+  const loginButton = document.getElementById("login-button");
+  const modelSelect = document.getElementById("model-select");
+  const effortField = document.getElementById("effort-field");
+  const effortSelect = document.getElementById("effort-select");
+  const logoutButton = document.getElementById("logout-button");
+  const messagesEl = document.getElementById("messages");
+  const emptyStateEl = document.getElementById("empty-state");
+  const composer = document.getElementById("composer");
+  const inputEl = document.getElementById("input");
+  const sendButton = document.getElementById("send-button");
+  const copyInputButton = document.getElementById("copy-input-button");
+
+  const state = { messages: [], models: [], streaming: false };
+
+  /* ---------- Markdown ---------- */
+  function renderMarkdown(text) {
+    if (window.marked && window.DOMPurify) {
+      return window.DOMPurify.sanitize(window.marked.parse(text, { breaks: true, gfm: true }));
+    }
+    // CDN 失敗時のフォールバック: プレーンテキストとして表示
+    const tmp = document.createElement("div");
+    tmp.textContent = text;
+    return tmp.innerHTML.replace(/\n/g, "<br>");
+  }
+
+  /* ---------- ユーティリティ ---------- */
+  function scrollToBottom() {
+    const main = document.querySelector(".chat-main");
+    main.scrollTop = main.scrollHeight;
+  }
+
+  async function copyText(text, button) {
+    if (!text) return;
+    let done = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      done = true;
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        done = document.execCommand("copy");
+      } catch {
+        done = false;
+      }
+      ta.remove();
+    }
+    if (button) {
+      if (!button.dataset.label) button.dataset.label = button.textContent;
+      button.textContent = done ? "コピーしました" : "コピーに失敗しました";
+      setTimeout(() => {
+        button.textContent = button.dataset.label;
+      }, 1500);
+    }
+  }
+
+  function showToast(message) {
+    const toast = document.createElement("div");
+    toast.className = "toast";
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+  }
+
+  /* ---------- メッセージ描画 ---------- */
+  function buildMessage(role, initialText) {
+    const wrap = document.createElement("article");
+    wrap.className = `message message-${role}`;
+
+    const meta = document.createElement("div");
+    meta.className = "message-meta";
+    const label = document.createElement("span");
+    label.textContent = role === "user" ? "あなた" : "Claude";
+    meta.appendChild(label);
+
+    const body = document.createElement("div");
+    body.className = "message-body";
+    wrap.append(meta, body);
+
+    let raw = initialText || "";
+    const render = () => {
+      body.innerHTML = renderMarkdown(raw);
+    };
+
+    if (role === "assistant") {
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "copy-button";
+      copyBtn.textContent = "コピー";
+      copyBtn.addEventListener("click", () => copyText(raw, copyBtn));
+      meta.appendChild(copyBtn);
+    }
+
+    render();
+    emptyStateEl.hidden = true;
+    messagesEl.appendChild(wrap);
+    scrollToBottom();
+
+    return {
+      append(delta) {
+        raw += delta;
+      },
+      render,
+      get raw() {
+        return raw;
+      },
+      showError(message) {
+        const err = document.createElement("p");
+        err.className = "inline-error";
+        err.textContent = message;
+        wrap.appendChild(err);
+        scrollToBottom();
+      },
+      remove() {
+        wrap.remove();
+      },
+    };
+  }
+
+  /* ---------- SSE ストリーミング ---------- */
+  async function streamResponse(body, onDelta) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let streamError = "";
+
+    const handleEvent = (rawEvent) => {
+      const dataLines = [];
+      for (const line of rawEvent.split(/\r?\n/)) {
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (!dataLines.length) return;
+      let data;
+      try {
+        data = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (data.type === "content_block_delta" && data.delta && data.delta.type === "text_delta") {
+        onDelta(data.delta.text);
+      } else if (data.type === "error") {
+        streamError = (data.error && data.error.type) || "unknown";
+      }
+    };
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop();
+      for (const ev of events) handleEvent(ev);
+    }
+    if (buffer.trim()) handleEvent(buffer);
+    if (streamError) {
+      throw new Error("応答の途中でエラーが発生しました。もう一度お試しください。");
+    }
+  }
+
+  /* ---------- 送信 ---------- */
+  function setStreaming(flag) {
+    state.streaming = flag;
+    sendButton.disabled = flag;
+    sendButton.textContent = flag ? "送信中…" : "送信";
+  }
+
+  function autoResize() {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+  }
+
+  async function handleSend() {
+    const text = inputEl.value.trim();
+    if (!text || state.streaming) return;
+
+    inputEl.value = "";
+    autoResize();
+    const userMsg = buildMessage("user", text);
+    state.messages.push({ role: "user", content: text });
+    const assistantMsg = buildMessage("assistant", "");
+    setStreaming(true);
+
+    let renderScheduled = false;
+    const scheduleRender = () => {
+      if (renderScheduled) return;
+      renderScheduled = true;
+      requestAnimationFrame(() => {
+        renderScheduled = false;
+        assistantMsg.render();
+        scrollToBottom();
+      });
+    };
+
+    let received = false;
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: state.messages,
+          model: modelSelect.value,
+          effort: effortSelect.disabled ? undefined : effortSelect.value,
+        }),
+      });
+
+      if (res.status === 401) {
+        rollback();
+        showLoginView("セッションが切れました。再度ログインしてください。");
+        return;
+      }
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => null);
+        throw new Error((data && data.error) || "エラーが発生しました。時間をおいて再試行してください。");
+      }
+
+      await streamResponse(res.body, (delta) => {
+        received = true;
+        assistantMsg.append(delta);
+        scheduleRender();
+      });
+
+      assistantMsg.render();
+      scrollToBottom();
+      state.messages.push({ role: "assistant", content: assistantMsg.raw });
+    } catch (err) {
+      if (!received) {
+        // 送信自体の失敗: ユーザーメッセージを取り消して入力を復元
+        rollback();
+        showToast(err.message || "エラーが発生しました。");
+      } else {
+        // 途中まで届いている場合は部分応答を残してエラーを併記
+        assistantMsg.render();
+        state.messages.push({ role: "assistant", content: assistantMsg.raw });
+        assistantMsg.showError(err.message || "ストリーミング中にエラーが発生しました。");
+      }
+    } finally {
+      setStreaming(false);
+      inputEl.focus();
+    }
+
+    function rollback() {
+      state.messages.pop();
+      userMsg.remove();
+      assistantMsg.remove();
+      inputEl.value = text;
+      autoResize();
+    }
+  }
+
+  /* ---------- 画面切り替え / 初期化 ---------- */
+  function showLoginView(message) {
+    chatView.hidden = true;
+    loginView.hidden = false;
+    if (message) loginError.textContent = message;
+    loginCode.focus();
+  }
+
+  function updateEffortState() {
+    const model = state.models.find((m) => m.id === modelSelect.value);
+    const supported = Boolean(model && model.supportsEffort);
+    effortSelect.disabled = !supported;
+    effortField.classList.toggle("is-disabled", !supported);
+    effortField.title = supported ? "" : "このモデルでは Effort は利用できません";
+  }
+
+  async function loadModels() {
+    const res = await fetch("/api/models");
+    if (!res.ok) return;
+    const { models } = await res.json();
+    state.models = models;
+    modelSelect.innerHTML = "";
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.label;
+      modelSelect.appendChild(opt);
+    }
+    updateEffortState();
+  }
+
+  async function enterChat() {
+    loginView.hidden = true;
+    chatView.hidden = false;
+    await loadModels();
+    inputEl.focus();
+  }
+
+  /* ---------- イベント ---------- */
+  loginForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    loginError.textContent = "";
+    loginButton.disabled = true;
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: loginCode.value }),
+      });
+      if (res.ok) {
+        loginCode.value = "";
+        await enterChat();
+      } else {
+        const data = await res.json().catch(() => null);
+        loginError.textContent = (data && data.error) || "ログインに失敗しました。";
+      }
+    } catch {
+      loginError.textContent = "通信エラーが発生しました。";
+    } finally {
+      loginButton.disabled = false;
+      loginCode.focus();
+    }
+  });
+
+  logoutButton.addEventListener("click", async () => {
+    await fetch("/api/logout", { method: "POST" }).catch(() => {});
+    location.reload();
+  });
+
+  modelSelect.addEventListener("change", updateEffortState);
+
+  composer.addEventListener("submit", (e) => {
+    e.preventDefault();
+    handleSend();
+  });
+
+  inputEl.addEventListener("keydown", (e) => {
+    // 日本語IME変換中の Enter では送信しない
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      handleSend();
+    }
+  });
+
+  inputEl.addEventListener("input", autoResize);
+
+  copyInputButton.addEventListener("click", () => copyText(inputEl.value, copyInputButton));
+
+  /* ---------- 起動 ---------- */
+  (async function init() {
+    try {
+      const res = await fetch("/api/session");
+      if (res.ok) {
+        await enterChat();
+        return;
+      }
+    } catch {
+      // ネットワーク不通時もログイン画面を表示
+    }
+    showLoginView();
+  })();
+})();
+```
+
+```text
+# File: public/_headers
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'
+```
+
+## テスト
+
+```js
+// File: test/auth.test.js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  createSessionCookie,
+  clearSessionCookie,
+  verifyRequest,
+  timingSafeEqual,
+} from "../src/auth.js";
+
+const SECRET = "test-secret-key";
+
+function requestWith(token) {
+  return new Request("https://example.com/api/chat", {
+    headers: { Cookie: `session=${token}` },
+  });
+}
+
+test("timingSafeEqual の基本動作", () => {
+  assert.equal(timingSafeEqual("1359", "1359"), true);
+  assert.equal(timingSafeEqual("1359", "1358"), false);
+  assert.equal(timingSafeEqual("1359", "135"), false);
+  assert.equal(timingSafeEqual("", ""), false);
+});
+
+test("発行したセッションCookieで認証できる", async () => {
+  const cookie = await createSessionCookie(SECRET);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /Secure/);
+  assert.match(cookie, /SameSite=Strict/);
+  const token = cookie.split(";")[0].replace("session=", "");
+  assert.equal(await verifyRequest(requestWith(token), SECRET), true);
+});
+
+test("改ざんされたトークンは拒否される", async () => {
+  const cookie = await createSessionCookie(SECRET);
+  const token = cookie.split(";")[0].replace("session=", "");
+  const forged = token.slice(0, -1) + (token.endsWith("0") ? "1" : "0");
+  assert.equal(await verifyRequest(requestWith(forged), SECRET), false);
+});
+
+test("異なる秘密鍵では拒否される", async () => {
+  const cookie = await createSessionCookie(SECRET);
+  const token = cookie.split(";")[0].replace("session=", "");
+  assert.equal(await verifyRequest(requestWith(token), "other-secret"), false);
+});
+
+test("期限切れトークンは拒否される", async () => {
+  const cookie = await createSessionCookie(SECRET, -10);
+  const token = cookie.split(";")[0].replace("session=", "");
+  assert.equal(await verifyRequest(requestWith(token), SECRET), false);
+});
+
+test("Cookieなし・秘密鍵なしは拒否される", async () => {
+  assert.equal(await verifyRequest(new Request("https://example.com/"), SECRET), false);
+  assert.equal(await verifyRequest(requestWith("x.y"), ""), false);
+});
+
+test("clearSessionCookie は Max-Age=0 を返す", () => {
+  assert.match(clearSessionCookie(), /Max-Age=0/);
+});
+```
+
+```js
+// File: test/validate.test.js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { validateChatBody } from "../src/validate.js";
+import { MODELS } from "../src/config.js";
+
+const EFFORT_MODEL = MODELS.find((m) => m.supportsEffort).id;
+const NORMAL_MODEL = MODELS[0].id;
+
+test("正常なリクエストは通る", () => {
+  const r = validateChatBody({
+    model: NORMAL_MODEL,
+    messages: [{ role: "user", content: "こんにちは" }],
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.effort, null);
+});
+
+test("許可リスト外のモデルは拒否される", () => {
+  const r = validateChatBody({
+    model: "claude-3-5-sonnet-20240620",
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(r.ok, false);
+});
+
+test("空・空白のみのメッセージは拒否される", () => {
+  assert.equal(validateChatBody({ model: NORMAL_MODEL, messages: [] }).ok, false);
+  assert.equal(
+    validateChatBody({ model: NORMAL_MODEL, messages: [{ role: "user", content: "  " }] }).ok,
+    false,
+  );
+});
+
+test("不正な role は拒否される", () => {
+  const r = validateChatBody({
+    model: NORMAL_MODEL,
+    messages: [{ role: "system", content: "x" }],
+  });
+  assert.equal(r.ok, false);
+});
+
+test("effort は対応モデルかつ有効値のときのみ採用される", () => {
+  const applied = validateChatBody({
+    model: EFFORT_MODEL,
+    messages: [{ role: "user", content: "hi" }],
+    effort: "low",
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.value.effort, "low");
+
+  const unsupported = validateChatBody({
+    model: NORMAL_MODEL,
+    messages: [{ role: "user", content: "hi" }],
+    effort: "low",
+  });
+  assert.equal(unsupported.ok, true);
+  assert.equal(unsupported.value.effort, null);
+
+  const invalid = validateChatBody({
+    model: EFFORT_MODEL,
+    messages: [{ role: "user", content: "hi" }],
+    effort: "max",
+  });
+  assert.equal(invalid.value.effort, null);
+});
+
+test("連続する同一 role は結合され、先頭は user に揃う", () => {
+  const r = validateChatBody({
+    model: NORMAL_MODEL,
+    messages: [
+      { role: "assistant", content: "a" },
+      { role: "user", content: "u1" },
+      { role: "user", content: "u2" },
+    ],
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value.messages, [{ role: "user", content: "u1\n\nu2" }]);
+});
+
+test("長すぎるメッセージは拒否される", () => {
+  const r = validateChatBody({
+    model: NORMAL_MODEL,
+    messages: [{ role: "user", content: "a".repeat(8001) }],
+  });
+  assert.equal(r.ok, false);
+});
+```
+
+## README
+
+````markdown
+<!-- File: README.md -->
+# Claude Chat
+
+Cloudflare Workers 上で動く、Claude API 利用のシンプルなチャット Web アプリです。
+API キーはサーバー側のシークレットとして管理され、ブラウザには一切露出しません。
+
+## 機能
+
+- 簡易ログイン（アクセスコード方式。デフォルト: `1359`）
+- モデル選択: Claude Haiku 4.5 / Claude Sonnet 4.5 / Claude Opus 4.5
+- Effort（推論量）選択: Opus 4.5 のみ Low / Medium / High
+- ストリーミング表示（SSE）、チャット履歴表示
+- 入出力ともに Markdown レンダリング（コードブロック・箇条書き・表など）
+- 入力欄・各回答にワンクリックのコピーボタン
+- PC / スマホ対応の落ち着いた UI
+
+## 技術構成
+
+- Cloudflare Workers（API プロキシ + 認証）+ Workers Static Assets（フロントエンド配信）
+- ビルド不要。依存は開発用の `wrangler` のみ
+- Markdown: `marked` + `DOMPurify`（CDN 読み込み。失敗時はプレーンテキストにフォールバック）
+- テスト: Node.js 標準の `node:test`
+
+## モデルと Effort について（一次情報に基づく判断）
+
+- モデルIDは Anthropic 公式ドキュメント「Models overview」に基づく
+  - Claude Haiku 4.5: `claude-haiku-4-5-20251001`
+  - Claude Sonnet 4.5: `claude-sonnet-4-5-20250929`
+  - Claude Opus 4.5: `claude-opus-4-5-20251101`
+- 要件で挙がっていた「Sonnet 5 / Opus 5」は実装時点で公式に提供されていないため、
+  利用可能な最新モデル（Sonnet 4.5 / Opus 4.5）に置き換えている。
+  新モデルが公開された場合は `src/config.js` の `MODELS` 配列だけを更新すればよい。
+- Effort は公式ドキュメント「Effort」に基づき Opus 4.5 のみ有効化している
+  - `output_config: { effort: "low" | "medium" | "high" }` を送信
+  - beta ヘッダー `anthropic-beta: effort-2025-11-24` を付与
+  - 非対応モデルでは UI 上で選択肢を無効化し、サーバー側でも effort を送信しない
+
+## 前提
+
+- Node.js 20 以上
+- Cloudflare アカウント
+- Anthropic API キー（Console で発行）
+
+## ローカルでの起動方法
+
+1. 依存関係のインストール
+
+       npm install
+
+2. 環境変数ファイルの作成
+
+       cp .dev.vars.example .dev.vars
+
+   `.dev.vars` を編集し、以下を設定する
+
+       CLAUDE_API_KEY=sk-ant-...        # 必須
+       ACCESS_CODE=1359                 # 任意（未設定時は 1359）
+       AUTH_SECRET=ランダムな長い文字列  # 推奨
+
+3. 開発サーバー起動
+
+       npm run dev
+
+4. 表示された URL（通常は `http://localhost:8787`）にアクセスし、
+   アクセスコード `1359` でログインする
+
+   なお、ログイン画面には意地悪な注意書きとして
+   「アルファベット大文字小文字記号を含む」と表示されるが、
+   実際の判定条件は `ACCESS_CODE`（デフォルト `1359`）との一致のみである。
+
+## Cloudflare へのデプロイ手順
+
+1. Cloudflare にログイン
+
+       npx wrangler login
+
+2. シークレットの登録（対話プロンプトで値を入力）
+
+       npx wrangler secret put CLAUDE_API_KEY
+       npx wrangler secret put AUTH_SECRET
+       npx wrangler secret put ACCESS_CODE
+
+   - `CLAUDE_API_KEY` は必須
+   - `AUTH_SECRET` は推奨（未設定時は `CLAUDE_API_KEY` からセッション署名鍵を派生）
+   - `ACCESS_CODE` は任意（未設定時は `1359`）
+
+3. デプロイ
+
+       npm run deploy
+
+4. 発行された `https://<name>.<account>.workers.dev` にアクセスして動作確認
+
+   カスタムドメインを使う場合は `wrangler.toml` に `routes` を追加するか、
+   ダッシュボードから設定する。
+
+## 環境変数一覧
+
+| 名前 | 種別 | 必須 | 説明 |
+| --- | --- | --- | --- |
+| `CLAUDE_API_KEY` | secret | 必須 | Anthropic API キー。サーバー側のみで使用 |
+| `ACCESS_CODE` | secret | 任意 | ログイン用アクセスコード。未設定時は `1359` |
+| `AUTH_SECRET` | secret | 推奨 | セッション Cookie の署名鍵。未設定時は `CLAUDE_API_KEY` で代用 |
+
+## テスト
+
+    npm test
+
+`node:test` で認証（署名・改ざん・期限切れ）とリクエスト検証
+（モデル許可リスト、effort の適用条件、role 正規化など）をカバーしている。
+
+## セキュリティ上の注意
+
+- 本アプリの認証はあくまで簡易的なアクセス制限。
+  本格的な保護が必要な場合は Cloudflare Access などの利用を推奨する。
+- API キーは Workers のシークレットにのみ存在し、
+  クライアントのコード・レスポンス・エラーメッセージには含まれない。
+- 上流 API のエラー詳細はサーバーログにのみ出力し、
+  画面には状況別の定型メッセージのみ表示する。
+- セッション Cookie は `HttpOnly; Secure; SameSite=Strict`、有効期限 7 日。
+- CSP 等のセキュリティヘッダーは `public/_headers` で付与している。
+
+## ファイル構成
+
+    claude-chat/
+    ├── wrangler.toml          # Worker 設定（静的アセット配信含む）
+    ├── package.json
+    ├── .dev.vars.example      # ローカル用環境変数テンプレート
+    ├── src/
+    │   ├── worker.js          # ルーティング・API プロキシ・SSE 中継
+    │   ├── auth.js            # アクセスコード検証・セッション署名/検証
+    │   ├── config.js          # モデル一覧・effort 設定（更新ポイント）
+    │   └── validate.js        # リクエスト検証・正規化
+    ├── public/
+    │   ├── index.html         # ログイン画面 + チャット画面
+    │   ├── styles.css
+    │   ├── app.js             # フロントエンドロジック・SSE クライアント
+    │   └── _headers           # セキュリティヘッダー
+    └── test/
+        ├── auth.test.js
+        └── validate.test.js
+
+## トラブルシューティング
+
+- 「サーバー側の認証設定に問題があります」と出る
+  → `CLAUDE_API_KEY` が未設定か無効。`wrangler secret put CLAUDE_API_KEY` で再設定。
+- 「利用制限に達しました」と出る
+  → Anthropic 側のレート制限。時間をおくか利用プランを確認。
+- Markdown がレンダリングされない
+  → CDN（jsdelivr）への接続を確認。接続できない場合はプレーンテキストで表示される仕様。
+  完全なオフライン動作が必要な場合は marked / DOMPurify を `public/vendor/` に同梱し、
+  `index.html` の script タグと CSP を書き換える。
+````
+
+## 動作確認チェックリスト
+
+- `npm install` → `cp .dev.vars.example .dev.vars`（キー記入）→ `npm run dev` → `npm test` が全パス
+- `localhost:8787` でログイン画面が表示され、`1359` でのみチャット画面へ遷移
+- 未ログイン状態で `/api/chat` へ直接POSTすると 401 が返る
+- モデル切替: Haiku 4.5 / Sonnet 4.5 では Effort が無効化、Opus 4.5 で有効化
+- 回答がストリーミングで逐次表示され、コードブロック・箇条書きがレンダリングされる
+- 各回答の「コピー」でMarkdown原文が、「入力をコピー」で入力テキストがコピーされる
+- APIキーを故意に無効化しても、画面にキーや内部情報が表示されない（定型エラーのみ）
