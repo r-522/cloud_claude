@@ -11,7 +11,8 @@
  *
  * effort（推論量）:
  *  - `output_config.effort` はGA機能でベータヘッダー不要。
- *  - Haiku 4.5 / Opus 5 / Sonnet 5 はいずれも low/medium/high/xhigh/max の全レベルに対応。
+ *  - Opus 5 / Sonnet 5 は low/medium/high/xhigh/max の全レベルに対応。
+ *  - Haiku 4.5 は effort に非対応（supportsEffort: false）。
  *  - Opus 5 / Sonnet 5 は思考（thinking）がデフォルトで有効（adaptive）であり、
  *    本アプリでは明示的に thinking を無効化しない（無効化はeffort次第で400になる
  *    組み合わせが存在するため、意図的に触れない）。
@@ -33,7 +34,7 @@ export const MODELS: readonly ModelDef[] = [
     id: "claude-haiku-4-5",
     label: "Haiku 4.5",
     description: "高速・低コスト",
-    supportsEffort: true,
+    supportsEffort: false,
   },
   {
     id: "claude-sonnet-5",
