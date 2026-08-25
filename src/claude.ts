@@ -9,8 +9,6 @@ export const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 export const ANTHROPIC_VERSION = "2023-06-01";
 export const MAX_TOKENS = 8192;
 export const MAX_MESSAGES = 40;
-export const MAX_MESSAGE_CHARS = 20000;
-export const MAX_TOTAL_CHARS = 100000;
 
 export class ClientInputError extends Error {}
 
@@ -51,7 +49,6 @@ export function buildRequest(input: ChatRequestInput): ValidatedChat {
     throw new ClientInputError("会話が長くなりすぎました。新しい会話を開始してください。");
   }
 
-  let totalChars = 0;
   const messages: ChatMessage[] = [];
   for (const raw of input.messages) {
     if (typeof raw !== "object" || raw === null) {
@@ -65,16 +62,9 @@ export function buildRequest(input: ChatRequestInput): ValidatedChat {
     if (typeof content !== "string" || content.trim().length === 0) {
       throw new ClientInputError("空のメッセージは送信できません。");
     }
-    if (content.length > MAX_MESSAGE_CHARS) {
-      throw new ClientInputError("1件のメッセージが長すぎます。");
-    }
-    totalChars += content.length;
     messages.push({ role, content });
   }
 
-  if (totalChars > MAX_TOTAL_CHARS) {
-    throw new ClientInputError("会話履歴が長すぎます。");
-  }
   if (messages[messages.length - 1]?.role !== "user") {
     throw new ClientInputError("メッセージの順序が正しくありません。");
   }
@@ -226,7 +216,7 @@ export async function callClaude(apiKey: string, body: AnthropicRequestBody): Pr
 
 /** 上流のステータスコードを、内部情報を含まないユーザー向け文言へ変換する */
 export function friendlyUpstreamError(status: number): string {
-  if (status === 400) return "リクエストの内容が受け付けられませんでした。入力を短くして再試行してください。";
+  if (status === 400) return "リク���ストの内容が受け付けられませんでした。入力を短くして再試行してください。";
   if (status === 401 || status === 403) return "サーバー側の設定に問題があります。管理者にお問い合わせください。";
   if (status === 404) return "指定されたモデルを利用できません。別のモデルを選択してください。";
   if (status === 413) return "入力が長すぎます。会話を新しく開始するか、内容を短くしてください。";
