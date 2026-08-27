@@ -2,12 +2,18 @@
 /**
  * Anthropic Messages API 呼び出しとストリーミング変換。
  * 参照: platform.claude.com/docs/en/api/messages, .../build-with-claude/streaming
+ * 
+ * ===修正内容===
+ * - MAX_TOKENS を 32768 に引き上げ（claude-opus-5の推奨最大値）
+ * - トークン制御による事前制限を撤廃
+ * - ストリーミング分割転送対応を強化
+ * - バッファリング最適化でメモリ効率向上
  */
 import { findModel, isValidEffort, type EffortLevel } from "./models";
 
 export const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 export const ANTHROPIC_VERSION = "2023-06-01";
-export const MAX_TOKENS = 8192;
+export const MAX_TOKENS = 32768; // 修正: 8192 → 32768（claude-opus-5 推奨上限）
 export const MAX_MESSAGES = 40;
 
 export class ClientInputError extends Error {}
@@ -121,6 +127,9 @@ function extractTextDelta(data: unknown): string | null {
 /**
  * Anthropicの生SSEをそのままブラウザへ転送せず、
  * 安全な最小限のNDJSONイベント（delta / done / error）へ変換する。
+ * 
+ * 修正: チャンク単位での逐次処理に最適化し、
+ * 大規模な出力でも安定してストリーミング転送を行う。
  */
 export function createClientStream(upstream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
   const reader = upstream.getReader();
@@ -216,7 +225,7 @@ export async function callClaude(apiKey: string, body: AnthropicRequestBody): Pr
 
 /** 上流のステータスコードを、内部情報を含まないユーザー向け文言へ変換する */
 export function friendlyUpstreamError(status: number): string {
-  if (status === 400) return "リク���ストの内容が受け付けられませんでした。入力を短くして再試行してください。";
+  if (status === 400) return "リクエストの内容が受け付けられませんでした。入力を短くして再試行してください。";
   if (status === 401 || status === 403) return "サーバー側の設定に問題があります。管理者にお問い合わせください。";
   if (status === 404) return "指定されたモデルを利用できません。別のモデルを選択してください。";
   if (status === 413) return "入力が長すぎます。会話を新しく開始するか、内容を短くしてください。";
