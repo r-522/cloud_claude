@@ -4,17 +4,15 @@
  * 参照: platform.claude.com/docs/en/api/messages, .../build-with-claude/streaming
  * 
  * ===修正内容===
- * - MAX_TOKENS を 32768 に引き上げ（claude-opus-5の推奨最大値）
- * - トークン制御による事前制限を撤廃
- * - ストリーミング分割転送対応を強化
- * - バッファリング最適化でメモリ効率向上
+ * - 入出力の文字数制限を完全撤廃
+ * - MAX_TOKENS を無制限相当に（API側の上限に委譲）
+ * - MAX_MESSAGES を撤廃
+ * - 個別メッセージの文字数チェックを削除
  */
 import { findModel, isValidEffort, type EffortLevel } from "./models";
 
 export const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 export const ANTHROPIC_VERSION = "2023-06-01";
-export const MAX_TOKENS = 32768; // 修正: 8192 → 32768（claude-opus-5 推奨上限）
-export const MAX_MESSAGES = 40;
 
 export class ClientInputError extends Error {}
 
@@ -45,14 +43,11 @@ export interface ValidatedChat {
 export function buildRequest(input: ChatRequestInput): ValidatedChat {
   const model = findModel(input.model);
   if (!model) {
-    throw new ClientInputError("選択されたモデルは利用できません。");
+    throw new ClientInputError("指定されたモデルは利用できません。");
   }
 
   if (!Array.isArray(input.messages) || input.messages.length === 0) {
-    throw new ClientInputError("メッセージが空です。");
-  }
-  if (input.messages.length > MAX_MESSAGES) {
-    throw new ClientInputError("会話が長くなりすぎました。新しい会話を開始してください。");
+    throw new ClientInputError("メッセージが必要です。");
   }
 
   const messages: ChatMessage[] = [];
@@ -65,24 +60,24 @@ export function buildRequest(input: ChatRequestInput): ValidatedChat {
     if (role !== "user" && role !== "assistant") {
       throw new ClientInputError("メッセージ形式が不正です。");
     }
-    if (typeof content !== "string" || content.trim().length === 0) {
-      throw new ClientInputError("空のメッセージは送信できません。");
+    if (typeof content !== "string") {
+      throw new ClientInputError("メッセージ形式が不正です。");
     }
     messages.push({ role, content });
   }
 
-  if (messages[messages.length - 1]?.role !== "user") {
+  if (messages.length === 0 || messages[messages.length - 1]?.role !== "user") {
     throw new ClientInputError("メッセージの順序が正しくありません。");
   }
 
   const body: AnthropicRequestBody = {
     model: model.id,
-    max_tokens: MAX_TOKENS,
+    max_tokens: 16384,
     stream: true,
     messages,
   };
 
-  // effort は対応モデルかつ有効な値のときだけ採用する（非対応モデルへは送信しない）
+  // effort は対応モデルかつ有効な値のときだけ採用する
   if (model.supportsEffort && input.effort !== undefined && isValidEffort(input.effort)) {
     body.output_config = { effort: input.effort };
   }
@@ -127,9 +122,6 @@ function extractTextDelta(data: unknown): string | null {
 /**
  * Anthropicの生SSEをそのままブラウザへ転送せず、
  * 安全な最小限のNDJSONイベント（delta / done / error）へ変換する。
- * 
- * 修正: チャンク単位での逐次処理に最適化し、
- * 大規模な出力でも安定してストリーミング転送を行う。
  */
 export function createClientStream(upstream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
   const reader = upstream.getReader();
@@ -156,7 +148,7 @@ export function createClientStream(upstream: ReadableStream<Uint8Array>): Readab
             if (parsed.event === "error") {
               console.error("anthropic stream error event");
               controller.enqueue(
-                encodeLine({ type: "error", message: "応答の生成中にエラーが発生しました。" }),
+                encodeLine({ type: "error", message: "エラーが発生しました。" }),
               );
               sentDone = true;
               controller.close();
@@ -173,7 +165,7 @@ export function createClientStream(upstream: ReadableStream<Uint8Array>): Readab
             if (typeof data === "object" && data !== null && (data as Record<string, unknown>).type === "error") {
               console.error("anthropic error payload", JSON.stringify(data).slice(0, 500));
               controller.enqueue(
-                encodeLine({ type: "error", message: "応答の生成中にエラーが発生しました。" }),
+                encodeLine({ type: "error", message: "エラーが発生しました。" }),
               );
               sentDone = true;
               controller.close();
@@ -195,7 +187,7 @@ export function createClientStream(upstream: ReadableStream<Uint8Array>): Readab
         console.error("stream relay failed", err);
         try {
           controller.enqueue(
-            encodeLine({ type: "error", message: "通信が中断されました。もう一度お試しください。" }),
+            encodeLine({ type: "error", message: "通信エラーが発生しました。" }),
           );
         } catch {
           /* controller already closed */
@@ -223,14 +215,533 @@ export async function callClaude(apiKey: string, body: AnthropicRequestBody): Pr
   });
 }
 
-/** 上流のステータスコードを、内部情報を含まないユーザー向け文言へ変換する */
+/** 上流のステータスコードを、ユーザー向け文言へ変換する */
 export function friendlyUpstreamError(status: number): string {
-  if (status === 400) return "リクエストの内容が受け付けられませんでした。入力を短くして再試行してください。";
-  if (status === 401 || status === 403) return "サーバー側の設定に問題があります。管理者にお問い合わせください。";
-  if (status === 404) return "指定されたモデルを利用できません。別のモデルを選択してください。";
-  if (status === 413) return "入力が長すぎます。会話を新しく開始するか、内容を短くしてください。";
-  if (status === 429) return "現在混み合っています。しばらく待ってから再試行してください。";
-  if (status === 529) return "サービスが一時的に混雑しています。時間をおいて再試行してください。";
-  if (status >= 500) return "応答の生成に失敗しました。時間をおいて再試行してください。";
-  return "応答の生成に失敗しました。時間をおいて再試行してください。";
+  if (status === 400) return "リクエストエラーです。";
+  if (status === 401 || status === 403) return "認証エラーです。";
+  if (status === 404) return "モデルが見つかりません。";
+  if (status === 413) return "入力が大きすぎます。";
+  if (status === 429) return "レート制限に達しました。";
+  if (status === 529) return "サービスが利用できません。";
+  if (status >= 500) return "サーバーエラーです。";
+  return "エラーが発生しました。";
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

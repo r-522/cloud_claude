@@ -72,7 +72,7 @@ async function copyText(text, button) {
       }, 1200);
     }
   } catch {
-    showError("クリップボードにコピーできませんでした。");
+    showError("コピーに失敗しました。");
   }
 }
 
@@ -173,7 +173,7 @@ function syncEffortAvailability() {
   const supported = Boolean(model && model.supportsEffort);
   els.effortSelect.disabled = !supported;
   els.effortControl.classList.toggle("is-disabled", !supported);
-  els.effortControl.title = supported ? "" : "このモデルは推論量の指定に対応していません。";
+  els.effortControl.title = supported ? "" : "";
 }
 
 els.modelSelect.addEventListener("change", () => {
@@ -242,7 +242,7 @@ function renderMessages() {
   if (state.turns.length === 0) {
     const empty = document.createElement("p");
     empty.className = "empty";
-    empty.textContent = "メッセージを入力して会話を開始します。";
+    empty.textContent = "メッセージを入力して開始します。";
     els.messagesInner.appendChild(empty);
     return;
   }
@@ -334,7 +334,7 @@ async function readError(response) {
   } catch {
     /* ignore */
   }
-  return "エラーが発生しました。時間をおいて再試行してください。";
+  return "エラーが発生しました。";
 }
 
 async function sendMessage(text) {
@@ -369,7 +369,7 @@ async function sendMessage(text) {
 
     if (res.status === 401) {
       enterLogin();
-      throw new Error("セッションの有効期限が切れました。もう一度ログインしてください。");
+      throw new Error("セッションの有効期限が切れました。");
     }
     if (!res.ok || !res.body) {
       throw new Error(await readError(res));
@@ -398,7 +398,7 @@ async function sendMessage(text) {
           assistant.content += event.text;
           scheduleStreamRender();
         } else if (event.type === "error") {
-          streamError = event.message || "応答の生成中にエラーが発生しました。";
+          streamError = event.message || "エラーが発生しました。";
         }
       }
     }
@@ -410,12 +410,11 @@ async function sendMessage(text) {
     if (streamError) {
       showError(streamError);
     } else if (!assistant.content) {
-      showError("応答を取得できませんでした。もう一度お試しください。");
+      showError("応答がありません。");
     }
   } catch (err) {
     assistant.pending = false;
     if (!assistant.content) {
-      // 送信自体が失敗: ユーザーメッセージを含めて取り消し、入力を復元
       state.turns.splice(state.turns.length - 2, 2);
       els.input.value = text;
       autoResize();
@@ -443,3 +442,38 @@ async function sendMessage(text) {
   }
   enterLogin();
 })();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
