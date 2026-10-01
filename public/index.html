@@ -15,7 +15,6 @@
     <section class="login" id="login-view">
       <div class="login-card">
         <h1>Claude Chat</h1>
-        <p class="lead">続けるにはアクセスコードを入力してください。</p>
         <form id="login-form" autocomplete="off" novalidate>
           <label class="field" for="access-code">アクセスコード</label>
           <input
@@ -28,7 +27,6 @@
             spellcheck="false"
             required
           />
-          <p class="hint">アルファベット大文字・小文字・記号を含む必要があります。</p>
           <button class="btn btn-primary btn-block" type="submit" id="login-submit">続ける</button>
           <p class="form-error" id="login-error" role="alert"></p>
         </form>
@@ -55,7 +53,7 @@
 
       <div class="messages" id="messages">
         <div class="messages-inner" id="messages-inner">
-          <p class="empty" id="empty-state">メッセージを入力して会話を開始します。</p>
+          <p class="empty" id="empty-state">メッセージを入力して開始します。</p>
         </div>
       </div>
 
@@ -68,13 +66,13 @@
           <textarea
             id="input"
             rows="1"
-            placeholder="メッセージを入力（Markdown対応）"
+            placeholder="メッセージを入力"
             autocomplete="off"
             spellcheck="false"
           ></textarea>
           <div class="composer-bar">
             <span class="composer-hint" id="send-hint">Enterで送信 / Shift+Enterで改行</span>
-            <button class="btn-quiet" type="button" id="copy-input">入力をコピー</button>
+            <button class="btn-quiet" type="button" id="copy-input">コピー</button>
             <button class="btn btn-primary" type="submit" id="send">送信</button>
           </div>
         </form>
@@ -84,3 +82,10 @@
     <script type="module" src="/app.js"></script>
   </body>
 </html>
+
+
+
+
+
+
+

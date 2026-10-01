@@ -45,23 +45,22 @@ async function hasValidSession(request: Request, env: Env): Promise<boolean> {
 async function handleLogin(request: Request, env: Env, url: URL): Promise<Response> {
   if (!env.SESSION_SECRET) {
     console.error("SESSION_SECRET is not configured");
-    return json({ error: "サーバーの設定が完了していません。管理者にお問い合わせください。" }, 500);
+    return json({ error: "サーバーエラーです。" }, 500);
   }
 
   let body: { code?: unknown };
   try {
     body = (await request.json()) as { code?: unknown };
   } catch {
-    return json({ error: "リクエストの形式が正しくありません。" }, 400);
+    return json({ error: "リクエストエラーです。" }, 400);
   }
 
   const input = typeof body.code === "string" ? body.code : "";
   const expected = env.ACCESS_CODE || DEFAULT_ACCESS_CODE;
 
   if (!input || !timingSafeEqual(input, expected)) {
-    // 総当たりへの気休め程度の緩和
     await new Promise((resolve) => setTimeout(resolve, 400));
-    return json({ error: "アクセスコードが正しくありません。" }, 401);
+    return json({ error: "ログインに失敗しました。" }, 401);
   }
 
   const token = await createSessionToken(env.SESSION_SECRET);
@@ -75,18 +74,18 @@ function handleLogout(url: URL): Response {
 async function handleChat(request: Request, env: Env): Promise<Response> {
   if (!env.CLAUDE_API_KEY) {
     console.error("CLAUDE_API_KEY is not configured");
-    return json({ error: "サーバーの設定が完了していません。管理者にお問い合わせください。" }, 500);
+    return json({ error: "サーバーエラーです。" }, 500);
   }
 
   let payload: unknown;
   try {
     payload = await request.json();
   } catch {
-    return json({ error: "リクエストの形式が正しくありません。" }, 400);
+    return json({ error: "リクエストエラーです。" }, 400);
   }
 
   if (typeof payload !== "object" || payload === null) {
-    return json({ error: "リクエストの形式が正しくありません。" }, 400);
+    return json({ error: "リクエストエラーです。" }, 400);
   }
 
   const { body } = buildRequest(payload as Record<string, unknown>);
@@ -96,7 +95,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     upstream = await callClaude(env.CLAUDE_API_KEY, body);
   } catch (err) {
     console.error("upstream fetch failed", err);
-    return json({ error: "Claude APIに接続できませんでした。時間をおいて再試行してください。" }, 502);
+    return json({ error: "接続エラーです。" }, 502);
   }
 
   if (!upstream.ok || !upstream.body) {
@@ -163,7 +162,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return handleChat(request, env);
   }
 
-  return json({ error: "指定されたAPIは見つかりません。" }, 404);
+  return json({ error: "APIが見つかりません。" }, 404);
 }
 
 export default {
@@ -180,7 +179,111 @@ export default {
         return json({ error: err.message }, 400);
       }
       console.error("unhandled error", err);
-      return json({ error: "予期しないエラーが発生しました。時間をおいて再試行してください。" }, 500);
+      return json({ error: "エラーが発生しました。" }, 500);
     }
   },
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
